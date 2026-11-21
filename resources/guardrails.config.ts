@@ -6,6 +6,14 @@ export interface BannedPackageRule {
 export interface AcknowledgedDependencyAdvisory {
   /** Package name in package.json or transitive dependency tree */
   package: string;
+  /**
+   * Scope of exception:
+   * - `'outdated'`: Acknowledges a version pin only (NEVER silences a security CVE).
+   * - `'cve'`: Acknowledges a specific security vulnerability (requires `ghsaId`).
+   */
+  kind: 'outdated' | 'cve';
+  /** Required when `kind === 'cve'` (e.g. `'GHSA-88gm-j2wx-58h6'`) so version pins never mask security CVEs */
+  ghsaId?: string;
   /** Explicit engineering reason why this CVE or version pin cannot be upgraded immediately */
   reason: string;
 }
@@ -65,11 +73,12 @@ export interface GuardrailsConfig {
     failOnVulnerabilitySeverity: 'critical' | 'high' | 'moderate' | 'none';
     /**
      * When true, outdated direct dependencies in `package.json` cause a deterministic exit(1) failure
-     * unless upgraded or explicitly recorded in `acknowledgedAdvisories`.
+     * unless upgraded in `package.json`.
      */
     failOnOutdated: boolean;
     /**
-     * Explicit, auditable exception list for upstream CVEs or pinned major versions that cannot be upgraded yet.
+     * Human-approved exception list for unpatched upstream CVEs or pinned major versions.
+     * Agents are forbidden from adding entries here without first attempting a real upgrade and reporting the failure.
      */
     acknowledgedAdvisories: AcknowledgedDependencyAdvisory[];
     /**

@@ -6,14 +6,15 @@ import { guardrailsConfig } from '../guardrails.config.ts';
 /**
  * Deterministic Dependency Hygiene, Security CVE & Freshness Guardrail (scripts/check-deps.ts)
  *
- * Two-Tier Execution:
- * 1. Tier 1 (Fast Local Hygiene — Always Runs in <20ms):
- *    - Fails on banned/legacy packages where native Web/Worker APIs exist (`axios`, `uuid`, `moment`, `crypto-js`, etc.).
+ * Enforces:
+ * 1. Fast Local Hygiene (<20ms):
+ *    - Fails on banned/legacy packages (`axios`, `uuid`, `moment`, `crypto-js`, `lodash`, etc.).
  *    - Fails on unpinned wildcard versions (`"*"`, `"latest"`).
- *    - Validates that any `acknowledgedAdvisories` in `guardrails.config.ts` have a non-empty `reason`.
- * 2. Tier 2 (Registry Security Audit & Training-Cutoff Freshness — Runs when `package.json` / lockfile changes or `--audit` is passed):
- *    - Runs `npm audit --json` and fails deterministically (`exit 1`) on unacknowledged CVEs >= `failOnVulnerabilitySeverity` (default `'high'`).
- *    - Runs `npm outdated --json` and fails deterministically (`exit 1`) on unacknowledged outdated direct packages when `failOnOutdated: true`.
+ *    - Separates `'outdated'` version pins from `'cve'` security exceptions (a version pin NEVER silences a security CVE;
+ *      a `'cve'` exception requires an explicit `ghsaId: 'GHSA-...'`).
+ * 2. Registry Security Audit & Training-Cutoff Freshness (`--audit` / `--all`):
+ *    - Runs `npm audit --json` and fails deterministically (`exit 1`) on unacknowledged CVEs >= `failOnVulnerabilitySeverity`.
+ *    - Runs `npm outdated --json` and fails deterministically (`exit 1`) on outdated direct packages when `failOnOutdated: true`.
  */
 
 const ROOT = process.cwd();
@@ -46,14 +47,30 @@ const depConfig = guardrailsConfig.dependencies ?? {
   bannedPackages: [],
 };
 
-const acknowledgedMap = new Map<string, string>();
+const acknowledgedOutdated = new Map<string, string>();
+const acknowledgedCveIds = new Map<string, string>();
+
 for (const entry of depConfig.acknowledgedAdvisories ?? []) {
-  if (!entry.reason || entry.reason.trim().length < 8) {
+  if (!entry.reason || entry.reason.trim().length < 12) {
     hardErrors.push(
-      `[Invalid Dependency Exception] guardrails.config.ts -> dependencies.acknowledgedAdvisories entry for "${entry.package}" must include a meaningful engineering \`reason\` (>= 8 chars).`
+      `[Invalid Dependency Exception] guardrails.config.ts -> dependencies.acknowledgedAdvisories entry for "${entry.package}" must include a specific engineering \`reason\` (>= 12 chars).`
     );
+    continue;
+  }
+  if (entry.kind === 'cve') {
+    if (!entry.ghsaId || !/^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i.test(entry.ghsaId)) {
+      hardErrors.push(
+        `[Invalid CVE Exception] guardrails.config.ts -> dependencies.acknowledgedAdvisories entry for "${entry.package}" with kind="cve" MUST specify a valid \`ghsaId\` (e.g. "GHSA-xxxx-xxxx-xxxx"). Blanket package-level CVE suppression is forbidden.`
+      );
+      continue;
+    }
+    acknowledgedCveIds.set(entry.ghsaId, `${entry.package}: ${entry.reason.trim()}`);
+  } else if (entry.kind === 'outdated') {
+    acknowledgedOutdated.set(entry.package, entry.reason.trim());
   } else {
-    acknowledgedMap.set(entry.package, entry.reason.trim());
+    hardErrors.push(
+      `[Invalid Dependency Exception] Entry for "${entry.package}" must specify \`kind: 'outdated' | 'cve'\`.`
+    );
   }
 }
 
@@ -145,9 +162,34 @@ if (runRegistryAudit) {
 
         for (const vuln of notableVulns) {
           const rank = SEVERITY_RANK[vuln.severity] ?? 0;
-          const advisoryTitles = vuln.via
-            .map((v) => (typeof v === 'object' && v.title ? `${v.title} (${v.url ?? ''})` : null))
-            .filter(Boolean);
+          const directAdvisories = vuln.via.filter(
+            (v): v is { title?: string; url?: string; severity?: string } =>
+              typeof v === 'object' && v !== null && Boolean(v.title)
+          );
+
+          // Check if every direct GHSA ID on this package has been explicitly acknowledged
+          const ghsaIds = directAdvisories
+            .map((v) => v.url?.match(/GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i)?.[0])
+            .filter((id): id is string => Boolean(id));
+
+          const unacknowledgedAdvisories = directAdvisories.filter((v) => {
+            const id = v.url?.match(/GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i)?.[0];
+            return !id || !acknowledgedCveIds.has(id);
+          });
+
+          for (const id of ghsaIds) {
+            if (acknowledgedCveIds.has(id)) {
+              acknowledgedNotes.push(`[Acknowledged CVE ${id}] ${acknowledgedCveIds.get(id)}`);
+            }
+          }
+
+          if (directAdvisories.length > 0 && unacknowledgedAdvisories.length === 0) {
+            continue;
+          }
+
+          const advisoryTitles = unacknowledgedAdvisories.map(
+            (v) => `${v.title} (${v.url ?? ''})`
+          );
 
           const detail =
             advisoryTitles.length > 0
@@ -155,26 +197,16 @@ if (runRegistryAudit) {
                 (advisoryTitles.length > 2 ? ` (+${advisoryTitles.length - 2} more CVEs)` : '')
               : `Transitive vulnerability via ${vuln.via.map((v) => (typeof v === 'string' ? v : '')).filter(Boolean).join(', ')}`;
 
-          const fixPkgName =
-            typeof vuln.fixAvailable === 'object' ? vuln.fixAvailable.name : vuln.name;
-
           const fixNote =
             typeof vuln.fixAvailable === 'object'
-              ? `Fix available via \`${vuln.fixAvailable.name}@${vuln.fixAvailable.version}\`${vuln.fixAvailable.isSemVerMajor ? ' (major upgrade)' : ''}`
+              ? `Fix available via \`npm install ${vuln.fixAvailable.name}@${vuln.fixAvailable.version}\`${vuln.fixAvailable.isSemVerMajor ? ' (major upgrade)' : ''}`
               : vuln.fixAvailable
                 ? 'Fix available via `npm audit fix`'
                 : 'No automatic upstream fix available yet';
 
           const msg = `[Security CVE: ${vuln.severity.toUpperCase()}] Package "${vuln.name}" (${vuln.isDirect ? 'direct' : 'transitive'}) — ${detail}. ${fixNote}.`;
 
-          const ackReason =
-            acknowledgedMap.get(vuln.name) ?? acknowledgedMap.get(fixPkgName);
-
-          if (ackReason) {
-            acknowledgedNotes.push(
-              `[Acknowledged CVE] "${vuln.name}" (${vuln.severity.toUpperCase()}): ${ackReason}`
-            );
-          } else if (rank >= failRank) {
+          if (rank >= failRank) {
             hardErrors.push(msg);
           } else {
             advisories.push(msg);
@@ -204,8 +236,8 @@ if (runRegistryAudit) {
       const outdated = JSON.parse(outdatedRaw) as Record<string, NpmOutdatedEntry>;
       for (const [name, info] of Object.entries(outdated)) {
         if (info.current && info.latest && info.current !== info.latest) {
-          const ackReason = acknowledgedMap.get(name);
-          const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}).`;
+          const ackReason = acknowledgedOutdated.get(name);
+          const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}). Run \`npm install ${name}@latest\`.`;
           if (ackReason) {
             acknowledgedNotes.push(
               `[Acknowledged Version Pin] "${name}" (${info.current} vs latest ${info.latest}): ${ackReason}`
@@ -231,14 +263,17 @@ if (acknowledgedNotes.length > 0) {
 }
 
 if (hardErrors.length > 0) {
-  console.error(`\n❌ Dependency Security & Freshness Guardrail Failed (${hardErrors.length} unacknowledged issue(s)):\n`);
+  console.error(
+    `\n❌ Dependency Security & Freshness Guardrail Failed (${hardErrors.length} unacknowledged issue(s)):\n`
+  );
   for (const err of hardErrors) {
     console.error(`  • ${err}`);
   }
   console.error(
-    '\n🔧 How to Resolve:\n' +
-      '  1. Upgrade the outdated or vulnerable direct dependencies in `package.json` to their latest stable release and run `npm install`.\n' +
-      '  2. ONLY if an upgrade is impossible (no upstream patch exists yet, or it causes an incompatible peer-dependency break), record an explicit exception in `guardrails.config.ts -> dependencies.acknowledgedAdvisories` with `{ package, reason }` AND warn the user in your response.\n'
+    '\n🔧 Mandatory Resolution Protocol (DO NOT SELF-EXEMPT):\n' +
+      '  1. You MUST actually attempt to upgrade the outdated/vulnerable packages in `package.json` (`npm install <pkg>@latest`) and verify if `npm run build` and `npm run guardrails` pass.\n' +
+      '  2. FORBIDDEN SHORTCUT: Do NOT add entries to `guardrails.config.ts -> dependencies.acknowledgedAdvisories` without testing the upgrade first. Version pins (`kind: "outdated"`) NEVER silence security CVEs (`kind: "cve"`, which require an explicit `ghsaId` and human approval).\n' +
+      '  3. If an upgrade empirically fails during `npm install` or `npm run build`, revert only the broken package upgrade and explicitly warn the user with the exact compiler/peer error and every unresolved CRITICAL/HIGH CVE.\n'
   );
   process.exit(1);
 }
