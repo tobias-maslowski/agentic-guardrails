@@ -14,6 +14,9 @@ Designed for modern TypeScript, Astro, Storyblok CMS, and Edge/Cloudflare Worker
    - **SSR Frontmatter Runtime Purity** (prevents importing browser-only globals like `document`, `window`, `navigator`, `HTMLElement` into Edge/Worker SSR frontmatter)
    - **Cross-File AST Statement Clone** detection
    - **Inline Type-Cast Escape** detection (`as any`, `as unknown as`, inline `as { ... }`)
+5. **Two-Tier Dependency Hygiene, Security Audit & Freshness (`check:deps`):**
+   - **Tier 1 (Local <20ms):** Blocks redundant legacy packages (`axios`, `node-fetch`, `uuid`, `moment`, `crypto-js`, `lodash`) in favor of built-in Web/Worker APIs (`fetch`, `crypto.randomUUID`, `crypto.subtle`, `Intl`) and rejects wildcard `"*"` / `"latest"` versions.
+   - **Tier 2 (Diff-Triggered on `package.json` / lockfile changes or `--all`):** Runs `npm audit --json` and `npm outdated --json` to surface known CVEs, remediation paths, and outdated package versions caused by LLM training-cutoff lag.
 
 ---
 

@@ -15,6 +15,9 @@ This skill enforces **four core engineering invariants** without bloating the ag
 2. **Deterministic Module Boundaries (`.dependency-cruiser.cjs` + `.astro` import checker):** Prevents cross-layer coupling across both 3-layer (`domain`, `worker`, `ui`) and 6-layer Enterprise Storyblok (`domain`, `cms`, `storyblok`, `ui`, `worker`, `pages`) stacks.
 3. **Zero Doc-Drift & Interactive UI Coverage (`scripts/check-doc-drift.ts`):** Verifies every file in `scopedModules` is registered in its folder's `AGENTS.md`, every ADR `applies_to` path exists on disk, every interactive UI component (`<button>` / `<script>`) has selector coverage in Playwright, and (when `storyblok` is enabled) every wrapper in `src/storyblok/*.astro` calls `storyblokEditable(blok)`.
 4. **AST Complexity & Architectural Smell Advisor (`scripts/check-complexity.ts`):** Uses the TypeScript Compiler AST (`ts.createSourceFile`) to advise when to introduce abstraction layers—catching high Cognitive/Cyclomatic complexity, fat inline `.astro` `<script>` blocks, SSR $\leftrightarrow$ Client `.innerHTML` dual-render duplication, SSR frontmatter browser-global impurity (`document`/`window`/`navigator` in edge SSR), cross-file logic clones, and inline type-cast escapes (`as any`, `as { ... }`).
+5. **Two-Tier Dependency Hygiene, Security CVE & Freshness Guardrail (`scripts/check-deps.ts`):**
+   - *Tier 1 (Always runs in <20ms):* Flags redundant legacy packages where built-in Web/Worker APIs exist (`axios`, `node-fetch`, `uuid`, `crypto-js`, `moment`, `lodash`) and unpinned `"*"` / `"latest"` versions.
+   - *Tier 2 (Auto-runs when `package.json` / lockfile changes or `--all`):* Runs `npm audit --json` and `npm outdated --json` to surface known security CVEs, available fixes, and training-cutoff version lag (agents must warn the user about any reported security gaps).
 
 ---
 
@@ -46,6 +49,7 @@ The bootstrapper automatically:
        "check:arch": "depcruise src --config .dependency-cruiser.cjs",
        "check:drift": "node --experimental-strip-types scripts/check-doc-drift.ts",
        "check:complexity": "node --experimental-strip-types scripts/check-complexity.ts",
+       "check:deps": "node --experimental-strip-types scripts/check-deps.ts",
        "check:visual": "playwright test",
        "check:types": "astro check && tsc --noEmit",
        "guardrails": "node --experimental-strip-types scripts/run-guardrails.ts"

@@ -59,6 +59,7 @@ copyIfMissingOrForce('guardrails.config.ts', 'guardrails.config.ts', force);
 copyIfMissingOrForce('run-guardrails.ts', 'scripts/run-guardrails.ts', force);
 copyIfMissingOrForce('check-doc-drift.ts', 'scripts/check-doc-drift.ts', force);
 copyIfMissingOrForce('check-complexity.ts', 'scripts/check-complexity.ts', force);
+copyIfMissingOrForce('check-deps.ts', 'scripts/check-deps.ts', force);
 copyIfMissingOrForce('dependency-cruiser.cjs', '.dependency-cruiser.cjs', force);
 
 // If --preset storyblok, patch guardrails.config.ts with the 5 Storyblok scoped modules and storyblok block

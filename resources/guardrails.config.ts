@@ -1,3 +1,8 @@
+export interface BannedPackageRule {
+  name: string;
+  replacement: string;
+}
+
 export interface GuardrailsConfig {
   /**
    * Directories that require a scoped `AGENTS.md` with an `## Exported Modules` registry.
@@ -43,6 +48,21 @@ export interface GuardrailsConfig {
   };
 
   /**
+   * Dependency hygiene, security vulnerability audit, and freshness configuration.
+   */
+  dependencies?: {
+    /**
+     * Minimum vulnerability severity that causes a hard exit(1) failure (`'critical' | 'high' | 'moderate' | 'none'`).
+     * Set to `'none'` to report all vulnerabilities as structured advisories without blocking offline builds.
+     */
+    failOnVulnerabilitySeverity: 'critical' | 'high' | 'moderate' | 'none';
+    /**
+     * Packages that agents should not install because modern Web/Node/Worker built-ins exist.
+     */
+    bannedPackages: BannedPackageRule[];
+  };
+
+  /**
    * Brownfield / Enterprise Ratchet Mode:
    * When true, `check:complexity` only reports advisories on files modified in `git status`.
    */
@@ -66,6 +86,18 @@ export const guardrailsConfig: GuardrailsConfig = {
   visualSpecPath: 'tests/visual-ui.spec.ts',
   globalLayoutAstroPath: 'src/pages/index.astro',
   forbiddenGlobalClassPrefixes: [],
+  dependencies: {
+    failOnVulnerabilitySeverity: 'none',
+    bannedPackages: [
+      { name: 'node-fetch', replacement: 'Built-in global `fetch()`' },
+      { name: 'axios', replacement: 'Built-in global `fetch()`' },
+      { name: 'uuid', replacement: 'Built-in Web Crypto `crypto.randomUUID()`' },
+      { name: 'crypto-js', replacement: 'Built-in Web Crypto `crypto.subtle`' },
+      { name: 'moment', replacement: 'Built-in `Intl.DateTimeFormat` or native `Date`' },
+      { name: 'lodash', replacement: 'Native ES2024+ Array/Object methods' },
+      { name: 'underscore', replacement: 'Native ES2024+ Array/Object methods' },
+    ],
+  },
   ratchetChangedFilesOnly: false,
   thresholds: {
     functionCognitive: 15,
