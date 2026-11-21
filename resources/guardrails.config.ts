@@ -3,6 +3,13 @@ export interface BannedPackageRule {
   replacement: string;
 }
 
+export interface AcknowledgedDependencyAdvisory {
+  /** Package name in package.json or transitive dependency tree */
+  package: string;
+  /** Explicit engineering reason why this CVE or version pin cannot be upgraded immediately */
+  reason: string;
+}
+
 export interface GuardrailsConfig {
   /**
    * Directories that require a scoped `AGENTS.md` with an `## Exported Modules` registry.
@@ -48,16 +55,25 @@ export interface GuardrailsConfig {
   };
 
   /**
-   * Dependency hygiene, security vulnerability audit, and freshness configuration.
+   * Deterministic dependency hygiene, security vulnerability gate, and freshness configuration.
    */
   dependencies?: {
     /**
-     * Minimum vulnerability severity that causes a hard exit(1) failure (`'critical' | 'high' | 'moderate' | 'none'`).
-     * Set to `'none'` to report all vulnerabilities as structured advisories without blocking offline builds.
+     * Minimum vulnerability severity that causes a deterministic exit(1) failure (`'critical' | 'high' | 'moderate' | 'none'`).
+     * Defaults to `'high'`.
      */
     failOnVulnerabilitySeverity: 'critical' | 'high' | 'moderate' | 'none';
     /**
-     * Packages that agents should not install because modern Web/Node/Worker built-ins exist.
+     * When true, outdated direct dependencies in `package.json` cause a deterministic exit(1) failure
+     * unless upgraded or explicitly recorded in `acknowledgedAdvisories`.
+     */
+    failOnOutdated: boolean;
+    /**
+     * Explicit, auditable exception list for upstream CVEs or pinned major versions that cannot be upgraded yet.
+     */
+    acknowledgedAdvisories: AcknowledgedDependencyAdvisory[];
+    /**
+     * Packages that agents must not install because modern Web/Node/Worker built-ins exist.
      */
     bannedPackages: BannedPackageRule[];
   };
@@ -87,7 +103,9 @@ export const guardrailsConfig: GuardrailsConfig = {
   globalLayoutAstroPath: 'src/pages/index.astro',
   forbiddenGlobalClassPrefixes: [],
   dependencies: {
-    failOnVulnerabilitySeverity: 'none',
+    failOnVulnerabilitySeverity: 'high',
+    failOnOutdated: true,
+    acknowledgedAdvisories: [],
     bannedPackages: [
       { name: 'node-fetch', replacement: 'Built-in global `fetch()`' },
       { name: 'axios', replacement: 'Built-in global `fetch()`' },

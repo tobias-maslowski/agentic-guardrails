@@ -4,15 +4,16 @@ import path from 'node:path';
 import { guardrailsConfig } from '../guardrails.config.ts';
 
 /**
- * Dependency Hygiene, Security Vulnerability & Freshness Guardrail (scripts/check-deps.ts)
+ * Deterministic Dependency Hygiene, Security CVE & Freshness Guardrail (scripts/check-deps.ts)
  *
  * Two-Tier Execution:
  * 1. Tier 1 (Fast Local Hygiene — Always Runs in <20ms):
- *    - Detects banned/legacy packages where native Web/Worker APIs exist (`axios`, `uuid`, `moment`, `crypto-js`, etc.).
- *    - Detects unpinned wildcard versions (`"*"`, `"latest"`).
+ *    - Fails on banned/legacy packages where native Web/Worker APIs exist (`axios`, `uuid`, `moment`, `crypto-js`, etc.).
+ *    - Fails on unpinned wildcard versions (`"*"`, `"latest"`).
+ *    - Validates that any `acknowledgedAdvisories` in `guardrails.config.ts` have a non-empty `reason`.
  * 2. Tier 2 (Registry Security Audit & Training-Cutoff Freshness — Runs when `package.json` / lockfile changes or `--audit` is passed):
- *    - Runs `npm audit --json` to surface known CVEs, severity levels, and whether an automatic upgrade fix exists.
- *    - Runs `npm outdated --json` to catch stale package versions hallucinated from an LLM's training cutoff.
+ *    - Runs `npm audit --json` and fails deterministically (`exit 1`) on unacknowledged CVEs >= `failOnVulnerabilitySeverity` (default `'high'`).
+ *    - Runs `npm outdated --json` and fails deterministically (`exit 1`) on unacknowledged outdated direct packages when `failOnOutdated: true`.
  */
 
 const ROOT = process.cwd();
@@ -36,11 +37,25 @@ const allDeps: Record<string, string> = {
 
 const hardErrors: string[] = [];
 const advisories: string[] = [];
+const acknowledgedNotes: string[] = [];
 
 const depConfig = guardrailsConfig.dependencies ?? {
-  failOnVulnerabilitySeverity: 'none',
+  failOnVulnerabilitySeverity: 'high',
+  failOnOutdated: true,
+  acknowledgedAdvisories: [],
   bannedPackages: [],
 };
+
+const acknowledgedMap = new Map<string, string>();
+for (const entry of depConfig.acknowledgedAdvisories ?? []) {
+  if (!entry.reason || entry.reason.trim().length < 8) {
+    hardErrors.push(
+      `[Invalid Dependency Exception] guardrails.config.ts -> dependencies.acknowledgedAdvisories entry for "${entry.package}" must include a meaningful engineering \`reason\` (>= 8 chars).`
+    );
+  } else {
+    acknowledgedMap.set(entry.package, entry.reason.trim());
+  }
+}
 
 // --- TIER 1: Fast Local Package Hygiene ---
 for (const banned of depConfig.bannedPackages) {
@@ -110,7 +125,6 @@ if (runRegistryAudit) {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch (err: unknown) {
-    // npm audit exits non-zero when vulnerabilities exist; stdout still contains the JSON report
     if (err && typeof err === 'object' && 'stdout' in err && typeof err.stdout === 'string') {
       auditJsonRaw = err.stdout;
     }
@@ -123,20 +137,11 @@ if (runRegistryAudit) {
       const total = counts.total ?? 0;
 
       if (total > 0 && report.vulnerabilities) {
-        const failRank = SEVERITY_RANK[depConfig.failOnVulnerabilitySeverity] ?? 99;
+        const failRank = SEVERITY_RANK[depConfig.failOnVulnerabilitySeverity] ?? 3;
 
         const notableVulns = Object.values(report.vulnerabilities).filter(
           (v) => (SEVERITY_RANK[v.severity] ?? 0) >= SEVERITY_RANK.moderate
         );
-
-        const summaryCounts = [
-          counts.critical ? `${counts.critical} critical` : '',
-          counts.high ? `${counts.high} high` : '',
-          counts.moderate ? `${counts.moderate} moderate` : '',
-          counts.low ? `${counts.low} low` : '',
-        ]
-          .filter(Boolean)
-          .join(', ');
 
         for (const vuln of notableVulns) {
           const rank = SEVERITY_RANK[vuln.severity] ?? 0;
@@ -150,24 +155,30 @@ if (runRegistryAudit) {
                 (advisoryTitles.length > 2 ? ` (+${advisoryTitles.length - 2} more CVEs)` : '')
               : `Transitive vulnerability via ${vuln.via.map((v) => (typeof v === 'string' ? v : '')).filter(Boolean).join(', ')}`;
 
+          const fixPkgName =
+            typeof vuln.fixAvailable === 'object' ? vuln.fixAvailable.name : vuln.name;
+
           const fixNote =
             typeof vuln.fixAvailable === 'object'
               ? `Fix available via \`${vuln.fixAvailable.name}@${vuln.fixAvailable.version}\`${vuln.fixAvailable.isSemVerMajor ? ' (major upgrade)' : ''}`
               : vuln.fixAvailable
                 ? 'Fix available via `npm audit fix`'
-                : 'No automatic fix available yet';
+                : 'No automatic upstream fix available yet';
 
           const msg = `[Security CVE: ${vuln.severity.toUpperCase()}] Package "${vuln.name}" (${vuln.isDirect ? 'direct' : 'transitive'}) — ${detail}. ${fixNote}.`;
 
-          if (rank >= failRank) {
+          const ackReason =
+            acknowledgedMap.get(vuln.name) ?? acknowledgedMap.get(fixPkgName);
+
+          if (ackReason) {
+            acknowledgedNotes.push(
+              `[Acknowledged CVE] "${vuln.name}" (${vuln.severity.toUpperCase()}): ${ackReason}`
+            );
+          } else if (rank >= failRank) {
             hardErrors.push(msg);
           } else {
             advisories.push(msg);
           }
-        }
-
-        if (notableVulns.length === 0 && total > 0) {
-          advisories.push(`[Security Audit] ${summaryCounts} vulnerability(s) detected.`);
         }
       }
     } catch {
@@ -183,7 +194,6 @@ if (runRegistryAudit) {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch (err: unknown) {
-    // npm outdated exits with code 1 when outdated packages exist
     if (err && typeof err === 'object' && 'stdout' in err && typeof err.stdout === 'string') {
       outdatedRaw = err.stdout;
     }
@@ -194,9 +204,17 @@ if (runRegistryAudit) {
       const outdated = JSON.parse(outdatedRaw) as Record<string, NpmOutdatedEntry>;
       for (const [name, info] of Object.entries(outdated)) {
         if (info.current && info.latest && info.current !== info.latest) {
-          advisories.push(
-            `[Outdated Dependency] "${name}" is at ${info.current} (wanted: ${info.wanted ?? info.current}, latest stable: ${info.latest}). Update package.json if compatible to avoid training-cutoff lag.`
-          );
+          const ackReason = acknowledgedMap.get(name);
+          const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}).`;
+          if (ackReason) {
+            acknowledgedNotes.push(
+              `[Acknowledged Version Pin] "${name}" (${info.current} vs latest ${info.latest}): ${ackReason}`
+            );
+          } else if (depConfig.failOnOutdated) {
+            hardErrors.push(msg);
+          } else {
+            advisories.push(msg);
+          }
         }
       }
     } catch {
@@ -205,23 +223,32 @@ if (runRegistryAudit) {
   }
 }
 
+if (acknowledgedNotes.length > 0) {
+  console.log(`\nℹ️  [Acknowledged Dependency Exceptions] (${acknowledgedNotes.length}):`);
+  for (const note of Array.from(new Set(acknowledgedNotes))) {
+    console.log(`  • ${note}`);
+  }
+}
+
 if (hardErrors.length > 0) {
-  console.error('\n❌ Dependency Guardrail Failed:\n');
+  console.error(`\n❌ Dependency Security & Freshness Guardrail Failed (${hardErrors.length} unacknowledged issue(s)):\n`);
   for (const err of hardErrors) {
     console.error(`  • ${err}`);
   }
-  console.error('');
+  console.error(
+    '\n🔧 How to Resolve:\n' +
+      '  1. Upgrade the outdated or vulnerable direct dependencies in `package.json` to their latest stable release and run `npm install`.\n' +
+      '  2. ONLY if an upgrade is impossible (no upstream patch exists yet, or it causes an incompatible peer-dependency break), record an explicit exception in `guardrails.config.ts -> dependencies.acknowledgedAdvisories` with `{ package, reason }` AND warn the user in your response.\n'
+  );
   process.exit(1);
 }
 
 console.log(
-  `✅ Dependency Hygiene Passed (${Object.keys(allDeps).length} direct packages checked${runRegistryAudit ? ' + registry security/freshness audit' : ''}).`
+  `✅ Dependency Guardrail Passed (${Object.keys(allDeps).length} direct packages checked${runRegistryAudit ? ' + registry CVE & freshness audit clean' : ''}).`
 );
 
 if (advisories.length > 0) {
-  console.log(
-    `\n🛡️  [Dependency Security & Freshness Advisories] (${advisories.length} finding(s) — report significant security gaps to the user):`
-  );
+  console.log(`\n🛡️  [Low/Moderate Dependency Advisories] (${advisories.length}):`);
   for (const adv of advisories) {
     console.log(`  • ${adv}`);
   }
