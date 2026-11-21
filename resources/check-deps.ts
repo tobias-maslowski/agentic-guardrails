@@ -146,7 +146,8 @@ if (runRegistryAudit) {
 
           const detail =
             advisoryTitles.length > 0
-              ? advisoryTitles.join('; ')
+              ? advisoryTitles.slice(0, 2).join('; ') +
+                (advisoryTitles.length > 2 ? ` (+${advisoryTitles.length - 2} more CVEs)` : '')
               : `Transitive vulnerability via ${vuln.via.map((v) => (typeof v === 'string' ? v : '')).filter(Boolean).join(', ')}`;
 
           const fixNote =
