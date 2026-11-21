@@ -77,7 +77,10 @@ const BROWSER_ONLY_GLOBALS = new Set([
 function getGitChangedFilesSet(): Set<string> | null {
   if (!guardrailsConfig.ratchetChangedFilesOnly) return null;
   try {
-    const out = execSync('git status --porcelain', { encoding: 'utf8' });
+    const out = execSync('git status --porcelain', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
     return new Set(
       out
         .split('\n')

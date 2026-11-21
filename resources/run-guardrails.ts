@@ -18,7 +18,10 @@ function run(cmd: string) {
 
 function getChangedFiles(): string[] {
   try {
-    const out = execSync('git status --porcelain', { encoding: 'utf8' });
+    const out = execSync('git status --porcelain', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
     return out
       .split('\n')
       .map((line) => line.slice(3).trim())
