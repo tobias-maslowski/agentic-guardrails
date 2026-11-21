@@ -11,9 +11,9 @@ description: >-
 # Agentic Guardrails Skill (Copilot · Claude Code · Antigravity)
 
 This skill enforces **four core engineering invariants** without bloating the agent's context window with prose rules:
-1. **Progressive Context Routing (<35-line root `AGENTS.md` + `CLAUDE.md` bridge):** Agents load only the scoped `src/<layer>/AGENTS.md` and ADRs relevant to their task (~1,400 tokens total).
-2. **Deterministic Module Boundaries (`.dependency-cruiser.cjs` + `.astro` import checker):** Prevents cross-layer coupling (e.g., `domain` importing outside `domain`, or `ui` importing `worker` / raw Storyblok CMS client internals).
-3. **Zero Doc-Drift & Interactive UI Coverage (`scripts/check-doc-drift.ts`):** Verifies every file in scoped directories is registered in its folder's `AGENTS.md`, every ADR `applies_to` path exists on disk, and every interactive UI component (`<button>` / `<script>`) has selector coverage in Playwright.
+1. **Progressive Context Routing (<35-line root `AGENTS.md` + `CLAUDE.md` & `.github/copilot-instructions.md` bridges):** Agents load only the scoped `src/<layer>/AGENTS.md` and ADRs relevant to their task (~1,200–1,400 tokens total).
+2. **Deterministic Module Boundaries (`.dependency-cruiser.cjs` + `.astro` import checker):** Prevents cross-layer coupling across both 3-layer (`domain`, `worker`, `ui`) and 6-layer Enterprise Storyblok (`domain`, `cms`, `storyblok`, `ui`, `worker`, `pages`) stacks.
+3. **Zero Doc-Drift & Interactive UI Coverage (`scripts/check-doc-drift.ts`):** Verifies every file in `scopedModules` is registered in its folder's `AGENTS.md`, every ADR `applies_to` path exists on disk, every interactive UI component (`<button>` / `<script>`) has selector coverage in Playwright, and (when `storyblok` is enabled) every wrapper in `src/storyblok/*.astro` calls `storyblokEditable(blok)`.
 4. **AST Complexity & Architectural Smell Advisor (`scripts/check-complexity.ts`):** Uses the TypeScript Compiler AST (`ts.createSourceFile`) to advise when to introduce abstraction layers—catching high Cognitive/Cyclomatic complexity, fat inline `.astro` `<script>` blocks, SSR $\leftrightarrow$ Client `.innerHTML` dual-render duplication, SSR frontmatter browser-global impurity (`document`/`window`/`navigator` in edge SSR), cross-file logic clones, and inline type-cast escapes (`as any`, `as { ... }`).
 
 ---
@@ -22,29 +22,24 @@ This skill enforces **four core engineering invariants** without bloating the ag
 
 When asked to bootstrap or set up agentic guardrails in a project:
 
-### Step 1: Inspect the Repository Layers
-Identify the project's top-level architectural directories under `src/` (for example):
-- **Standard App / Edge Bridge:** `src/domain`, `src/worker` (or `src/server`), `src/ui` (or `src/components`), `src/pages`
-- **Enterprise Storyblok CMS Stack:** `src/domain`, `src/cms`, `src/storyblok`, `src/ui`, `src/worker`, `src/pages`
+### Step 1: Run the Self-Contained Bootstrapper CLI
+Run `scripts/bootstrap-repo.mjs` from this skill directory. Pass `--preset storyblok` for Storyblok CMS architectures (or default `--preset standard` for 3-layer apps):
 
-### Step 2: Install the Guardrail Scripts from `./resources/`
-Run the zero-dependency bootstrapper from this skill directory (or copy the files from `./resources/`):
 ```bash
+# For Enterprise Storyblok + Astro + Edge/Worker projects:
+node <path-to-this-skill>/scripts/bootstrap-repo.mjs --target /path/to/target-repo --preset storyblok
+
+# For Standard 3-Layer (domain / worker / ui) projects:
 node <path-to-this-skill>/scripts/bootstrap-repo.mjs --target /path/to/target-repo
 ```
-Or manually copy:
-- [resources/guardrails.config.ts](./resources/guardrails.config.ts) $\rightarrow$ `<repo>/guardrails.config.ts`
-- [resources/run-guardrails.ts](./resources/run-guardrails.ts) $\rightarrow$ `<repo>/scripts/run-guardrails.ts`
-- [resources/check-doc-drift.ts](./resources/check-doc-drift.ts) $\rightarrow$ `<repo>/scripts/check-doc-drift.ts`
-- [resources/check-complexity.ts](./resources/check-complexity.ts) $\rightarrow$ `<repo>/scripts/check-complexity.ts`
-- [resources/dependency-cruiser.cjs](./resources/dependency-cruiser.cjs) $\rightarrow$ `<repo>/.dependency-cruiser.cjs`
 
-### Step 3: Tailor `guardrails.config.ts` & Context Files
-1. Edit `guardrails.config.ts` in the target repo to list its actual `scopedModules`, `uiPathPatterns`, and (for brownfield enterprise repos) set `ratchetChangedFilesOnly: true` if you want drift/complexity checks to apply only to files modified in `git status`.
-2. Create the root `AGENTS.md` (<35 lines) using [resources/templates/AGENTS.root.md](./resources/templates/AGENTS.root.md).
-3. Create a 1-line `CLAUDE.md` containing `@AGENTS.md` and `.github/copilot-instructions.md` pointing to `AGENTS.md` so **Claude Code, GitHub Copilot, and Antigravity** share a single source of truth.
-4. Create a concise `AGENTS.md` in each scoped module folder (`src/<module>/AGENTS.md`) listing its `## Purpose`, `## Constraints`, and `## Exported Modules`.
-5. Add `package.json` scripts:
+The bootstrapper automatically:
+- Creates the target directory (if needed) and installs `guardrails.config.ts`, `scripts/run-guardrails.ts`, `scripts/check-doc-drift.ts`, `scripts/check-complexity.ts`, and `.dependency-cruiser.cjs`.
+- Installs `AGENTS.md`, `CLAUDE.md` (`@AGENTS.md`), `.github/copilot-instructions.md`, `docs/adr/0001-layered-modular-boundaries.md`, and starter `src/<layer>/AGENTS.md` files for every configured module.
+- Updates `tsconfig.json` (if present) so `"scripts"` and `"guardrails.config.ts"` are excluded from Cloudflare Worker runtime typechecking (`@cloudflare/workers-types` vs Node CLI scripts).
+
+### Step 2: Wire `package.json` Scripts & Playwright Config
+1. Add the guardrail scripts to `package.json`:
    ```json
    {
      "scripts": {
@@ -52,11 +47,15 @@ Or manually copy:
        "check:drift": "node --experimental-strip-types scripts/check-doc-drift.ts",
        "check:complexity": "node --experimental-strip-types scripts/check-complexity.ts",
        "check:visual": "playwright test",
+       "check:types": "astro check && tsc --noEmit",
        "guardrails": "node --experimental-strip-types scripts/run-guardrails.ts"
      }
    }
    ```
-6. Run `npm run guardrails` and fix any initial drift or boundary issues until green.
+2. If using `tsconfig.json` with `"types": ["@cloudflare/workers-types"]`, ensure `"exclude": ["dist", "node_modules", "scripts", "guardrails.config.ts", "playwright.config.ts", "tests"]` is set so Cloudflare Worker typechecking doesn't collide with Node CLI scripts.
+3. In `playwright.config.ts` (template available at [resources/templates/playwright.config.ts](./resources/templates/playwright.config.ts)), point `webServer.url` to a project-specific route or API endpoint (e.g., `http://localhost:4321/api/...`) so `reuseExistingServer: true` never attaches to a different project's dev server.
+4. Tailor `guardrails.config.ts` (`scopedModules`, `uiTriggerPatterns`, `forbiddenGlobalClassPrefixes`, `ratchetChangedFilesOnly`) and update `## Exported Modules` in each `src/<layer>/AGENTS.md`.
+5. Run `npm run guardrails -- --all` and fix any drift or boundary violations until green.
 
 ---
 

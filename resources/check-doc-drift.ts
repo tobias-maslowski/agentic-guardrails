@@ -10,8 +10,9 @@ import { guardrailsConfig } from '../guardrails.config.ts';
  *    in that directory's `AGENTS.md` (and no deleted ghost files may remain listed).
  * 2. ADR Path Integrity: Every path listed in an ADR's `applies_to` or `enforced_by`
  *    frontmatter must exist on disk.
- * 3. Astro Import Boundaries: `.astro` files in `src/ui/` cannot import from `src/worker/`,
- *    `src/pages/`, or raw `src/cms/` internals.
+ * 3. Astro Import Boundaries:
+ *    - `.astro` files in `src/ui/` cannot import from `worker`, `pages`, `cms`, `storyblok`, or `@storyblok/*`.
+ *    - `.astro` files in `src/storyblok/` (if present) cannot import from `worker` or `pages`.
  * 4. Style Encapsulation: Global layout `.astro` file must not contain leaked component CSS prefixes.
  * 5. Interactive UI Coverage: Any `src/ui/*.astro` component with `<button` or `<script`
  *    must have at least one selector covered in `visualSpecPath`.
@@ -40,7 +41,7 @@ for (const modDir of guardrailsConfig.scopedModules) {
   const exportedSection = agentsMd.split('## Exported Modules')[1] ?? '';
   const documentedFiles = Array.from(
     exportedSection.matchAll(/^- `([^`]+)`/gm),
-    (m) => m[1]
+    (m: RegExpExecArray) => m[1]
   );
 
   for (const file of actualFiles) {
@@ -73,7 +74,10 @@ if (fs.existsSync(adrDir)) {
     }
 
     const fm = frontmatterMatch[1];
-    const pathMatches = Array.from(fm.matchAll(/^\s*-\s+(.+)$/gm), (m) => m[1].trim());
+    const pathMatches = Array.from(
+      fm.matchAll(/^\s*-\s+(.+)$/gm),
+      (m: RegExpExecArray) => m[1].trim()
+    );
     const enforcedMatch = fm.match(/^enforced_by:\s*(.+)$/m);
     if (enforcedMatch) {
       pathMatches.push(enforcedMatch[1].trim());
@@ -101,30 +105,61 @@ if (fs.existsSync(uiDir)) {
   const astroFiles = fs.readdirSync(uiDir).filter((f) => f.endsWith('.astro'));
   for (const file of astroFiles) {
     const content = fs.readFileSync(path.join(uiDir, file), 'utf8');
-    const imports = Array.from(content.matchAll(/from\s+['"]([^'"]+)['"]/g), (m) => m[1]);
+    const imports = Array.from(
+      content.matchAll(/from\s+['"]([^'"]+)['"]/g),
+      (m: RegExpExecArray) => m[1]
+    );
     for (const imp of imports) {
       if (
         imp.includes('/worker/') ||
         imp.startsWith('@worker/') ||
         imp.includes('/pages/') ||
         imp.includes('/cms/') ||
-        imp.includes('@storyblok/')
+        imp.startsWith('@cms/') ||
+        imp.includes('/storyblok/') ||
+        imp.startsWith('@storyblok/')
       ) {
         errors.push(
-          `[Astro Boundary Violation] src/ui/${file} imports "${imp}". ADR-0001 forbids src/ui/ from importing worker, pages, or CMS adapter internals.`
+          `[Astro Boundary Violation] src/ui/${file} imports "${imp}". ADR-0001 forbids src/ui/ from importing worker, pages, storyblok wrappers, or CMS adapter internals.`
         );
       }
     }
 
     if (visualSpecContent !== null && /<(button|script)\b/i.test(content)) {
       const selectors = [
-        ...Array.from(content.matchAll(/\bid=["']([^"']+)["']/g), (m) => m[1]),
-        ...Array.from(content.matchAll(/\b(data-[a-z0-9-]+)=/gi), (m) => m[1]),
+        ...Array.from(content.matchAll(/\bid=["']([^"']+)["']/g), (m: RegExpExecArray) => m[1]),
+        ...Array.from(
+          content.matchAll(/\b(data-[a-z0-9-]+)=/gi),
+          (m: RegExpExecArray) => m[1]
+        ),
       ];
       const isCovered = selectors.some((sel) => visualSpecContent.includes(sel));
       if (!isCovered) {
         errors.push(
           `[Untested Interactive UI] src/ui/${file} contains interactive controls (<button>/<script>), but none of its selectors (${selectors.join(', ') || 'none'}) are tested in ${guardrailsConfig.visualSpecPath}.`
+        );
+      }
+    }
+  }
+}
+
+// 3b. Check .astro import boundaries in src/storyblok/ (if present)
+const storyblokDir = path.join(
+  ROOT,
+  guardrailsConfig.storyblok?.wrapperDir ?? 'src/storyblok'
+);
+if (fs.existsSync(storyblokDir)) {
+  const sbAstroFiles = fs.readdirSync(storyblokDir).filter((f) => f.endsWith('.astro'));
+  for (const file of sbAstroFiles) {
+    const content = fs.readFileSync(path.join(storyblokDir, file), 'utf8');
+    const imports = Array.from(
+      content.matchAll(/from\s+['"]([^'"]+)['"]/g),
+      (m: RegExpExecArray) => m[1]
+    );
+    for (const imp of imports) {
+      if (imp.includes('/worker/') || imp.startsWith('@worker/') || imp.includes('/pages/')) {
+        errors.push(
+          `[Astro Boundary Violation] src/storyblok/${file} imports "${imp}". Storyblok wrappers cannot import from worker or pages.`
         );
       }
     }

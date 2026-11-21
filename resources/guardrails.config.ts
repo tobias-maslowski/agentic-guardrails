@@ -5,12 +5,13 @@ export interface GuardrailsConfig {
   scopedModules: string[];
 
   /**
-   * Directories scanned by the TypeScript & Astro AST Complexity & Smell Advisor.
+   * Optional additional directories scanned by the TypeScript & Astro AST Complexity Advisor
+   * beyond `scopedModules` (defaults to `['src/pages', 'public']`).
    */
-  complexityScanDirs: string[];
+  extraComplexityScanDirs?: string[];
 
   /**
-   * Regex patterns (as strings) that trigger `npm run check:visual` (Playwright)
+   * RegExp patterns that trigger `npm run check:visual` (Playwright)
    * when modified in `git status --porcelain`.
    */
   uiTriggerPatterns: RegExp[];
@@ -60,18 +61,11 @@ export interface GuardrailsConfig {
 
 export const guardrailsConfig: GuardrailsConfig = {
   scopedModules: ['src/domain', 'src/worker', 'src/ui'],
-  complexityScanDirs: ['src/domain', 'src/worker', 'src/ui', 'src/pages', 'public'],
+  extraComplexityScanDirs: ['src/pages', 'public'],
   uiTriggerPatterns: [/^src\/ui\//, /^src\/storyblok\//, /^src\/pages\/index\.astro$/, /^tests\//],
   visualSpecPath: 'tests/visual-ui.spec.ts',
   globalLayoutAstroPath: 'src/pages/index.astro',
-  forbiddenGlobalClassPrefixes: [
-    'passport-',
-    'tactics-',
-    'telemetry-',
-    'hero-',
-    'project-',
-    'spec-bar',
-  ],
+  forbiddenGlobalClassPrefixes: [],
   ratchetChangedFilesOnly: false,
   thresholds: {
     functionCognitive: 15,

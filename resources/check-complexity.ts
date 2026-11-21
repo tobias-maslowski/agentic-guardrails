@@ -533,7 +533,14 @@ const declarativeFiles: string[] = [];
 let smellAdvisories: CodeSmellAdvisory[] = [];
 const allFingerprints: StatementFingerprint[] = [];
 
-for (const dir of guardrailsConfig.complexityScanDirs) {
+const scanDirs = Array.from(
+  new Set([
+    ...guardrailsConfig.scopedModules,
+    ...(guardrailsConfig.extraComplexityScanDirs ?? ['src/pages', 'public']),
+  ])
+);
+
+for (const dir of scanDirs) {
   for (const relFile of collectFiles(dir)) {
     const raw = fs.readFileSync(path.join(ROOT, relFile), 'utf8');
     if (relFile.endsWith('.ts')) {
@@ -581,7 +588,7 @@ for (const dir of guardrailsConfig.complexityScanDirs) {
 
       const scriptMatches = Array.from(
         raw.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)
-      );
+      ) as RegExpExecArray[];
       for (const match of scriptMatches) {
         const scriptCode = match[1];
         const prefix = raw.slice(0, match.index ?? 0);
