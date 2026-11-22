@@ -65,13 +65,17 @@ copyIfMissingOrForce('dependency-cruiser.cjs', '.dependency-cruiser.cjs', force)
 // If --preset storyblok, patch guardrails.config.ts with the 5 Storyblok scoped modules and storyblok block
 if (isStoryblok) {
   const cfgPath = path.join(targetDir, 'guardrails.config.ts');
-  let cfg = fs.readFileSync(cfgPath, 'utf8');
-  cfg = cfg.replace(
+  const cfg = fs.readFileSync(cfgPath, 'utf8');
+  const patched = cfg.replace(
     "scopedModules: ['src/domain', 'src/worker', 'src/ui'],",
     "scopedModules: ['src/domain', 'src/cms', 'src/storyblok', 'src/ui', 'src/worker'],\n  storyblok: {\n    wrapperDir: 'src/storyblok',\n    requireStoryblokEditable: true,\n  },"
   );
-  fs.writeFileSync(cfgPath, cfg, 'utf8');
-  console.log('✅ Configured guardrails.config.ts for 6-layer Storyblok preset');
+  if (patched === cfg && !cfg.includes("'src/storyblok'")) {
+    console.error('❌ Could not apply the storyblok preset: scopedModules line not found in guardrails.config.ts.');
+    process.exit(1);
+  }
+  fs.writeFileSync(cfgPath, patched, 'utf8');
+  console.log('✅ Configured guardrails.config.ts for Storyblok preset');
 }
 
 // 2. Install Root Context Router (AGENTS.md), CLAUDE.md bridge, and GitHub Copilot instructions
@@ -94,10 +98,14 @@ if (!fs.existsSync(adrPath)) {
     'utf8'
   );
   if (isStoryblok) {
-    adrContent = adrContent.replace(
+    const patchedAdr = adrContent.replace(
       '  - src/domain\n  - src/ui\n  - src/worker\n  - src/pages',
       '  - src/domain\n  - src/cms\n  - src/storyblok\n  - src/ui\n  - src/worker\n  - src/pages'
     );
+    if (patchedAdr === adrContent) {
+      console.warn('⚠️  ADR applies_to list not patched for the storyblok preset; edit it manually.');
+    }
+    adrContent = patchedAdr;
   }
   writeIfMissingOrForce('docs/adr/0001-layered-modular-boundaries.md', adrContent, false);
 }
@@ -172,5 +180,32 @@ if (fs.existsSync(tsconfigPath)) {
     // Ignore non-standard JSON comments in tsconfig.json
   }
 }
+
+// 6. Add guardrail scripts to package.json (never overwrite existing ones)
+const pkgPath = path.join(targetDir, 'package.json');
+const GUARDRAIL_SCRIPTS = {
+  'check:arch': 'depcruise src --config .dependency-cruiser.cjs',
+  'check:drift': 'node --experimental-strip-types scripts/check-doc-drift.ts',
+  'check:complexity': 'node --experimental-strip-types scripts/check-complexity.ts',
+  'check:deps': 'node --experimental-strip-types scripts/check-deps.ts',
+  'check:visual': 'playwright test',
+  guardrails: 'node --experimental-strip-types scripts/run-guardrails.ts',
+};
+if (fs.existsSync(pkgPath)) {
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  pkg.scripts = pkg.scripts ?? {};
+  const added = [];
+  for (const [name, cmd] of Object.entries(GUARDRAIL_SCRIPTS)) {
+    if (!(name in pkg.scripts)) {
+      pkg.scripts[name] = cmd;
+      added.push(name);
+    }
+  }
+  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+  console.log(added.length ? `✅ Added package.json scripts: ${added.join(', ')}` : '⏭️  package.json scripts already present');
+} else {
+  console.log('ℹ️  No package.json found; add the guardrail scripts from SKILL.md manually.');
+}
+console.log('\nNext: npm install -D dependency-cruiser typescript @playwright/test');
 
 console.log(`\n🎯 Guardrails bootstrapped (${preset} preset) in ${targetDir}`);

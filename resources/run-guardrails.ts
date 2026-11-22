@@ -14,25 +14,34 @@ import { guardrailsConfig } from '../guardrails.config.ts';
  *    changes in `guardrailsConfig.uiTriggerPatterns` (or when `--all` is passed).
  */
 
-const DEP_FILE_PATTERNS = [/^package\.json$/, /^package-lock\.json$/, /^pnpm-lock\.yaml$/];
+const DEP_FILE_PATTERNS = [/^package\.json$/, /^package-lock\.json$/];
 
 function run(cmd: string) {
-  execSync(cmd, { stdio: 'inherit' });
+  try {
+    execSync(cmd, { stdio: 'inherit' });
+  } catch {
+    console.error(`\n❌ Guardrail failed: ${cmd}`);
+    process.exit(1);
+  }
 }
 
 function getChangedFiles(): string[] {
   try {
-    const out = execSync('git status --porcelain', {
+    // -z: NUL-separated, unquoted paths; renames emit "XY new\0old\0"
+    const out = execSync('git status --porcelain -z', {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    return out
-      .split('\n')
-      .map((line) => line.slice(3).trim())
-      .filter(Boolean)
-      .flatMap((entry) => entry.split(' -> '));
+    const parts = out.split('\0').filter(Boolean);
+    const files: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      files.push(parts[i].slice(3));
+      if (/^[RC]/.test(parts[i])) files.push(parts[++i]);
+    }
+    return files;
   } catch {
-    return ['src/ui/', 'package.json'];
+    // Not a git repo: no diff information, so only run the always-on checks.
+    return [];
   }
 }
 

@@ -13,5 +13,10 @@ mkdir -p "$HOME/.claude/skills"
 ln -sfn "$SKILL_DIR" "$HOME/.claude/skills/agentic-guardrails"
 echo "✅ Linked global Claude Code skill -> ~/.claude/skills/agentic-guardrails"
 
+# 3. GitHub Copilot CLI Global Skills Directory
+mkdir -p "$HOME/.copilot/skills"
+ln -sfn "$SKILL_DIR" "$HOME/.copilot/skills/agentic-guardrails"
+echo "✅ Linked global Copilot skill -> ~/.copilot/skills/agentic-guardrails"
+
 echo ""
 echo "Done! In Claude Code, GitHub Copilot, or Antigravity, you can now invoke 'agentic-guardrails'."

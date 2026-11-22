@@ -10,9 +10,9 @@ description: >-
 
 # Agentic Guardrails Skill (Copilot · Claude Code · Antigravity)
 
-This skill enforces **four core engineering invariants** without bloating the agent's context window with prose rules:
+This skill enforces **five core engineering invariants** without bloating the agent's context window with prose rules:
 1. **Progressive Context Routing (<35-line root `AGENTS.md` + `CLAUDE.md` & `.github/copilot-instructions.md` bridges):** Agents load only the scoped `src/<layer>/AGENTS.md` and ADRs relevant to their task (~1,200–1,400 tokens total).
-2. **Deterministic Module Boundaries (`.dependency-cruiser.cjs` + `.astro` import checker):** Prevents cross-layer coupling across both 3-layer (`domain`, `worker`, `ui`) and 6-layer Enterprise Storyblok (`domain`, `cms`, `storyblok`, `ui`, `worker`, `pages`) stacks.
+2. **Deterministic Module Boundaries (`.dependency-cruiser.cjs` + `.astro` import checker):** Prevents cross-layer coupling across both 3-layer (`domain`, `worker`, `ui`) and Enterprise Storyblok (`domain`, `cms`, `storyblok`, `ui`, `worker`, `pages`) stacks.
 3. **Zero Doc-Drift & Interactive UI Coverage (`scripts/check-doc-drift.ts`):** Verifies every file in `scopedModules` is registered in its folder's `AGENTS.md`, every ADR `applies_to` path exists on disk, every interactive UI component (`<button>` / `<script>`) has selector coverage in Playwright, and (when `storyblok` is enabled) every wrapper in `src/storyblok/*.astro` calls `storyblokEditable(blok)`.
 4. **AST Complexity & Architectural Smell Advisor (`scripts/check-complexity.ts`):** Uses the TypeScript Compiler AST (`ts.createSourceFile`) to advise when to introduce abstraction layers—catching high Cognitive/Cyclomatic complexity, fat inline `.astro` `<script>` blocks, SSR $\leftrightarrow$ Client `.innerHTML` dual-render duplication, SSR frontmatter browser-global impurity (`document`/`window`/`navigator` in edge SSR), cross-file logic clones, and inline type-cast escapes (`as any`, `as { ... }`).
 5. **Two-Tier Dependency Hygiene, Security CVE & Freshness Guardrail (`scripts/check-deps.ts`):**
@@ -26,7 +26,7 @@ This skill enforces **four core engineering invariants** without bloating the ag
 When asked to bootstrap or set up agentic guardrails in a project:
 
 ### Step 1: Run the Self-Contained Bootstrapper CLI
-Run `scripts/bootstrap-repo.mjs` from this skill directory. Pass `--preset storyblok` for Storyblok CMS architectures (or default `--preset standard` for 3-layer apps):
+Run `scripts/bootstrap-repo.mjs` from this skill directory. Pass `--preset storyblok` (5 scoped modules plus `src/pages`) for Storyblok CMS architectures (or default `--preset standard` for 3-layer apps):
 
 ```bash
 # For Enterprise Storyblok + Astro + Edge/Worker projects:
@@ -42,7 +42,7 @@ The bootstrapper automatically:
 - Updates `tsconfig.json` (if present) so `"scripts"` and `"guardrails.config.ts"` are excluded from Cloudflare Worker runtime typechecking (`@cloudflare/workers-types` vs Node CLI scripts).
 
 ### Step 2: Wire `package.json` Scripts & Playwright Config
-1. Add the guardrail scripts to `package.json`:
+1. The bootstrapper adds these scripts to `package.json` if missing (verify them):
    ```json
    {
      "scripts": {

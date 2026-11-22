@@ -2,7 +2,7 @@
 
 A portable **Agent Skill** and config-driven verification harness for **GitHub Copilot**, **Claude Code**, and **Google Antigravity**.
 
-Designed for modern TypeScript, Astro, Storyblok CMS, and Edge/Cloudflare Worker repositories to solve four failure modes of AI-assisted development:
+Designed for modern TypeScript, Astro, Storyblok CMS, and Edge/Cloudflare Worker repositories to solve five failure modes of AI-assisted development:
 
 1. **Context Overload:** Keeps root `AGENTS.md` under 35 lines (~500 tokens) using progressive directory routing (`src/<layer>/AGENTS.md` + `CLAUDE.md` bridge) so agents only read docs relevant to their current task.
 2. **Documentation & Schema Drift (`check:drift`):** Deterministically verifies that every module in `src/<layer>/` is documented in its scoped `AGENTS.md`, every ADR path reference exists on disk, every interactive UI control (`<button>` / `<script>`) is covered in Playwright, and (optionally) every Storyblok wrapper calls `storyblokEditable(blok)`.
@@ -20,6 +20,13 @@ Designed for modern TypeScript, Astro, Storyblok CMS, and Edge/Cloudflare Worker
 
 ---
 
+## Requirements
+
+- Node.js **>= 22.6** (scripts run via `node --experimental-strip-types`; the flag is a no-op on Node >= 23.6).
+- npm (`check:deps` uses `npm audit` / `npm outdated`).
+
+---
+
 ## 1. Install Globally on Your Machine (Claude Code & Antigravity)
 
 Clone this repository and run the global symlink installer:
@@ -34,8 +41,9 @@ chmod +x install-global-skill.sh
 This links the skill into both:
 - `~/.claude/skills/agentic-guardrails` (**Claude Code**)
 - `~/.gemini/config/skills/agentic-guardrails` (**Antigravity**)
+- `~/.copilot/skills/agentic-guardrails` (**GitHub Copilot CLI**)
 
-For **GitHub Copilot** (or team-shared repos), you can also vendor or submodule this folder into `.github/skills/agentic-guardrails` or `.claude/skills/agentic-guardrails`.
+For team-shared repos, you can also vendor or submodule this folder into `.github/skills/agentic-guardrails` or `.claude/skills/agentic-guardrails`.
 
 ---
 
@@ -55,7 +63,9 @@ This installs:
 - `scripts/run-guardrails.ts` — Diff-aware runner (runs static + AST complexity checks in `<300ms`; triggers Playwright `check:visual` automatically only when UI files are modified in `git status`).
 - `scripts/check-doc-drift.ts` — Doc-drift, ADR path integrity, `.astro` import boundary, style encapsulation, and interactive selector checker.
 - `scripts/check-complexity.ts` — TypeScript & Astro AST Complexity and Architectural Smell Advisor.
+- `scripts/check-deps.ts` — Two-tier dependency hygiene, CVE audit and freshness checker.
 - `.dependency-cruiser.cjs` — Module boundary rules.
+- `package.json` scripts (`check:*`, `guardrails`) — added if missing; existing scripts are never overwritten. You still need `depcruise`, `typescript` and `playwright` devDependencies (the bootstrapper prints the exact install command).
 - `AGENTS.md` & `CLAUDE.md` (`@AGENTS.md`) — Progressive context router shared across GitHub Copilot, Claude Code, and Antigravity.
 
 ---
