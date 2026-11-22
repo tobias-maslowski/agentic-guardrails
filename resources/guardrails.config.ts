@@ -20,7 +20,83 @@ export interface AcknowledgedDependencyAdvisory {
 
 export interface GuardrailsConfig {
   /**
+   * Monorepo mode (npm workspaces): workspace globs relative to the repo root (e.g. `['apps/*', 'packages/*']`).
+   * When set, every check iterates over the matching directories that contain a package.json, and
+   * `scopedModules` / `extraComplexityScanDirs` / `archDirs` are resolved inside each workspace.
+   * Leave undefined for a single-package repo.
+   */
+  workspaces?: string[];
+
+  /**
+   * Workspace layers, low -> high (monorepo mode). A workspace may only import workspaces of strictly lower layers.
+   * Entries are package names, workspace directories or `*` globs of directories.
+   * Either `string[][]` or `{ name, workspaces }[]`. When set, every workspace must be listed.
+   */
+  layers?: string[][] | Array<{ name: string; workspaces: string[] }>;
+
+  /**
+   * Existing layers file (root-relative JSON, e.g. `scripts/module-layers.json`) read instead of `layers`.
+   * Shapes: `{ layers: [{ name, workspaces|members|packages, devOnly? }] }`, `{ layers: [[...]] }`, or an object name -> array (low -> high).
+   * A `devOnly` layer may be depended on only through devDependencies/peerDependencies.
+   */
+  layersFile?: string;
+
+  /** Adopt mode: `check:imports` rules ('layers' | 'exports' | 'declared') skipped because existing tests already enforce them; requires `skipImportRulesReason`. */
+  skipImportRules?: string[];
+  skipImportRulesReason?: string;
+
+  /** Root-relative dir globs whose docs describe planned structure: dead-path claims there are not checked. Default `['docs/migration', 'docs/plan*', 'docs/adr']`. */
+  plannedPathDirs?: string[];
+
+  /** Site-wide access gate detection: `{ file?, status?, function?, from? }` (`function`/`from`: an imported gate function called in a middleware/worker entry). */
+  gate?: { file?: string | string[]; status?: number | number[]; function?: string; from?: string };
+
+  /** Extra directory names skipped by `check:imports` (defaults already skip node_modules, dist, build, coverage, out and dot-dirs). */
+  importScanIgnoreDirs?: string[];
+
+  /** Directories (relative to each project) cruised by `check:arch` / dependency-cruiser. Default `['src']`. */
+  archDirs?: string[];
+
+  /** Gates (npm script names) that must exist and pass. Default: check:arch, check:drift, check:complexity, check:deps (+ check:imports in monorepo mode). */
+  requiredGates?: string[];
+
+  /** Gates run when their script exists (root, or any workspace in monorepo mode). Default: check:ssr, build, check:types, typecheck, test. */
+  optionalGates?: string[];
+
+  /** Monorepo mode: fail when no `test` script exists in the root or any workspace. Default true; set false to opt out. */
+  requireTests?: boolean;
+
+  /** Fail (instead of advisory) when `.astro` files have a `<script>` or `client:*` directive and `visualSpecPath` is null. Default: true in monorepo mode, false otherwise. */
+  requireInteractiveSpecs?: boolean;
+
+  /** Require at least one decision record (`docs/adr/*.md`, not an AGENTS.md). Default: true in monorepo mode, false otherwise. */
+  requireAdr?: boolean;
+
+  /** Monorepo mode: per-workspace-group import bans for external/builtin specifiers. `forbid`/`allowOnly` are globs (`node:*`, `@storyblok/*`). */
+  externalRules?: Array<{ workspaces: string[]; forbid?: string[]; allowOnly?: string[] }>;
+
+  /** Virtual modules (e.g. `virtual:foo`) exempt from the undeclared-dependency check. */
+  virtualModules?: string[];
+
+  /**
+   * Test files (root-relative globs) exempt from `externalRules` and the undeclared-package check of `check:imports`, so a
+   * pure package can co-locate `node:test` suites. Default: `**\/*.test.*`, `**\/*.spec.*`, `**\/test/**`, `**\/tests/**`, `**\/__tests__/**`.
+   */
+  testGlobs?: string[];
+
+  /** Fast-tier time budget in ms; the runner warns above it (default 10000). */
+  fastTierBudgetMs?: number;
+
+  /** Doc path/route claims (globs with `*`) that are deliberately not on disk. */
+  docClaimsAllow?: string[];
+
+  /** Required together with `weakenedConfigReason` to accept a config that disables or narrows checks. */
+  allowWeakenedConfig?: boolean;
+  weakenedConfigReason?: string;
+
+  /**
    * Directories that require a scoped `AGENTS.md` with an `## Exported Modules` registry.
+   * In monorepo mode these are resolved inside every workspace and skipped where they do not exist.
    */
   scopedModules: string[];
 
@@ -40,7 +116,7 @@ export interface GuardrailsConfig {
    * Path to the Playwright visual/behavioral spec file used to verify interactive UI selectors.
    * Set to null to disable interactive selector coverage verification.
    */
-  visualSpecPath: string | null;
+  visualSpecPath: string | string[] | null;
 
   /**
    * Global layout / entry `.astro` file checked for leaked component-specific CSS selectors.
@@ -76,6 +152,10 @@ export interface GuardrailsConfig {
      * unless upgraded in `package.json`.
      */
     failOnOutdated: boolean;
+    /** Which gap to the latest release fails: 'major' (default), 'minor' or 'any'. Smaller gaps are only counted. */
+    outdatedPolicy?: 'major' | 'minor' | 'any';
+    /** Timeout for each `npm audit` / `npm outdated` call in `--audit` mode (default 30000). A timeout fails closed. */
+    auditTimeoutMs?: number;
     /**
      * Human-approved exception list for unpatched upstream CVEs or pinned major versions.
      * Agents are forbidden from adding entries here without first attempting a real upgrade and reporting the failure.
@@ -114,7 +194,9 @@ export interface GuardrailsConfig {
 export const guardrailsConfig: GuardrailsConfig = {
   scopedModules: ['src/domain', 'src/worker', 'src/ui'],
   extraComplexityScanDirs: ['src/pages', 'public'],
-  uiTriggerPatterns: [/^src\/ui\//, /^src\/storyblok\//, /^src\/pages\/index\.astro$/, /^tests\//],
+  // The ADR names the optional CMS layers; they only exist with the Storyblok preset.
+  docClaimsAllow: ['src/cms/', 'src/storyblok/'],
+  uiTriggerPatterns: [/^src\/ui\//, /^src\/storyblok\//, /^src\/pages\/index\.astro$/, /(^|\/)src\/.*\.astro$/, /^tests\//, /(^|\/)src\/.*(session|auth|cookie|middleware|mapper)/i],
   // Set to your Playwright spec (and install @playwright/test) to enable interactive-selector coverage and `check:visual`.
   visualSpecPath: null,
   globalLayoutAstroPath: 'src/pages/index.astro',
@@ -122,6 +204,7 @@ export const guardrailsConfig: GuardrailsConfig = {
   dependencies: {
     failOnVulnerabilitySeverity: 'high',
     failOnOutdated: true,
+    auditTimeoutMs: 30000,
     acknowledgedAdvisories: [],
     bannedPackages: [
       { name: 'node-fetch', replacement: 'Built-in global `fetch()`' },

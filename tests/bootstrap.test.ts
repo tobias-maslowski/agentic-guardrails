@@ -33,10 +33,17 @@ test('creates a package.json with scripts in an empty target; check:types only f
   assert.ok(pkg.scripts.guardrails);
   assert.equal(pkg.scripts['check:types'], undefined);
 
-  const astro = makeProject({ packageJson: { name: 'a', dependencies: { astro: '^5.0.0' } } });
+  // check:types is only installed when a tsconfig exists (a script that cannot run would be dead).
+  const astro = makeProject({ packageJson: { name: 'a', dependencies: { astro: '^5.0.0' } }, preFiles: { 'tsconfig.json': '{}' } });
   const apkg = JSON.parse(fs.readFileSync(path.join(astro.dir, 'package.json'), 'utf8'));
-  assert.ok(apkg.scripts['check:types']);
+  assert.equal(apkg.scripts['check:types'], undefined); // no @astrojs/check declared: plain tsc would fail on .astro imports
   astro.cleanup();
+  const astroOk = makeProject({ packageJson: { name: 'c', dependencies: { astro: '^5.0.0' }, devDependencies: { '@astrojs/check': '^0.9.0' } }, preFiles: { 'tsconfig.json': '{}' } });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(astroOk.dir, 'package.json'), 'utf8')).scripts['check:types'], 'astro check && tsc --noEmit');
+  astroOk.cleanup();
+  const noTs = makeProject({ packageJson: { name: 'b', dependencies: { astro: '^5.0.0' } } });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(noTs.dir, 'package.json'), 'utf8')).scripts['check:types'], undefined);
+  noTs.cleanup();
 });
 
 test('keeps existing differing scripts and warns', () => {
