@@ -26,7 +26,7 @@ export interface RunResult {
  * `typescript` is symlinked from the harness so check-complexity.ts can import it.
  */
 export function makeProject(
-  opts: { preset?: 'standard' | 'storyblok'; git?: boolean; packageJson?: object | null } = {}
+  opts: { preset?: 'standard' | 'storyblok'; git?: boolean; packageJson?: object | null; preFiles?: Record<string, string> } = {}
 ): Project {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardrails-'));
   if (opts.packageJson !== null) {
@@ -34,6 +34,10 @@ export function makeProject(
       path.join(dir, 'package.json'),
       JSON.stringify(opts.packageJson ?? { name: 'fixture', type: 'module' }, null, 2)
     );
+  }
+  for (const [rel, content] of Object.entries(opts.preFiles ?? {})) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
   }
   const args = [path.join(SKILL_ROOT, 'scripts/bootstrap-repo.mjs'), '--target', dir];
   if (opts.preset) args.push('--preset', opts.preset);
@@ -63,10 +67,56 @@ export function makeProject(
       const r = spawnSync(
         process.execPath,
         ['--experimental-strip-types', '--no-warnings', path.join(dir, 'scripts', script), ...args],
-        { cwd: dir, encoding: 'utf8', env: { ...process.env, ...env } }
+        { cwd: dir, encoding: 'utf8', env: { ...process.env, CI: '', ...env } }
       );
       return { status: r.status, stdout: r.stdout, stderr: r.stderr, output: r.stdout + r.stderr };
     },
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+export interface Monorepo {
+  dir: string;
+  write(rel: string, content: string): void;
+  /** Runs `scripts/guardrails/<script>` with the cwd at the repo root. */
+  run(script: string, args?: string[], env?: NodeJS.ProcessEnv): RunResult;
+  /** Runs an npm script of the root package.json. */
+  npm(args: string[], env?: NodeJS.ProcessEnv): RunResult;
+  cleanup(): void;
+}
+
+/** Creates an npm-workspaces monorepo from `files` (relative path -> content), bootstraps it at the root. */
+export function makeMonorepo(
+  files: Record<string, string>,
+  opts: { rootPackage?: object; config?: (cfg: string) => string; bootstrapArgs?: string[] } = {}
+): Monorepo {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'guardrails-mono-'));
+  const put = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  };
+  put('package.json', JSON.stringify(opts.rootPackage ?? { name: 'mono', private: true, type: 'module', workspaces: ['apps/*', 'packages/*'] }, null, 2));
+  for (const [rel, content] of Object.entries(files)) put(rel, content);
+  const boot = spawnSync(process.execPath, [path.join(SKILL_ROOT, 'scripts/bootstrap-repo.mjs'), '--target', dir, ...(opts.bootstrapArgs ?? [])], { encoding: 'utf8' });
+  if (boot.status !== 0) throw new Error(`bootstrap failed:\n${boot.stdout}\n${boot.stderr}`);
+  if (opts.config) {
+    const cfgPath = path.join(dir, 'guardrails.config.ts');
+    fs.writeFileSync(cfgPath, opts.config(fs.readFileSync(cfgPath, 'utf8')));
+  }
+  fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
+  fs.symlinkSync(path.join(SKILL_ROOT, 'node_modules/typescript'), path.join(dir, 'node_modules/typescript'), 'dir');
+  const exec = (args: string[], env: NodeJS.ProcessEnv, cmd = process.execPath) => {
+    const r = spawnSync(cmd, args, { cwd: dir, encoding: 'utf8', env: { ...process.env, CI: '', ...env } });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr, output: r.stdout + r.stderr };
+  };
+  return {
+    dir,
+    write: put,
+    run: (script, args = [], env = {}) =>
+      exec(['--experimental-strip-types', '--no-warnings', path.join(dir, 'scripts/guardrails', script), ...args], env),
+    npm: (args, env = {}) => exec(args, env, 'npm'),
     cleanup() {
       fs.rmSync(dir, { recursive: true, force: true });
     },

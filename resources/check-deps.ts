@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { guardrailsConfig } from '../guardrails.config.ts';
+import { ROOT, guardrailsConfig, isMonorepo, projects } from './context.ts';
+import { SUPPORTED_TS_MAJORS } from './ts-support.ts';
 
 /**
  * Deterministic Dependency Hygiene, Security CVE & Freshness Guardrail (scripts/check-deps.ts)
@@ -20,7 +21,6 @@ import { guardrailsConfig } from '../guardrails.config.ts';
  *    - Works from an npm workspace package directory: npm resolves the root lockfile itself.
  */
 
-const ROOT = process.cwd();
 const pkgPath = path.join(ROOT, 'package.json');
 
 if (!fs.existsSync(pkgPath)) {
@@ -50,9 +50,29 @@ try {
   process.exit(1);
 }
 
+// Every manifest to inspect: the root plus each workspace (monorepo mode).
+const manifests: Array<{ label: string; pkg: PackageJson }> = [{ label: 'package.json', pkg }];
+const localNames = new Set<string>();
+const manifestDirs: string[] = [];
+if (isMonorepo) {
+  for (const p of projects) {
+    localNames.add(p.name);
+    manifestDirs.push(p.abs);
+    try {
+      manifests.push({ label: `${p.dir}/package.json`, pkg: JSON.parse(fs.readFileSync(path.join(p.abs, 'package.json'), 'utf8')) as PackageJson });
+    } catch {
+      /* discovery already validated */
+    }
+  }
+}
+const isLocalSpec = (name: string, spec: string): boolean =>
+  localNames.has(name) || /^workspace:/.test(spec.trim());
+
 const directNames = new Set<string>();
-for (const section of DEP_SECTIONS) {
-  for (const name of Object.keys(pkg[section] ?? {})) directNames.add(name);
+for (const m of manifests) {
+  for (const section of DEP_SECTIONS) {
+    for (const name of Object.keys(m.pkg[section] ?? {})) if (!isLocalSpec(name, String(m.pkg[section]![name]))) directNames.add(name);
+  }
 }
 
 const hardErrors: string[] = [];
@@ -112,25 +132,29 @@ function resolveAlias(name: string, spec: string): { target: string; range: stri
 }
 
 // Each section is evaluated on its own so a devDependency cannot mask a runtime declaration.
-for (const section of DEP_SECTIONS) {
+// Identical findings across workspaces collapse into one entry prefixed with every declaring workspace.
+const declared = new Map<string, Set<string>>();
+const noteDeclared = (msg: string, manifestLabel: string): void => {
+  const where = manifestLabel === 'package.json' ? '.' : manifestLabel.replace(/\/package\.json$/, '');
+  (declared.get(msg) ?? declared.set(msg, new Set()).get(msg)!).add(where);
+};
+for (const { label: manifestLabel, pkg } of manifests) for (const section of DEP_SECTIONS) {
   for (const [name, rawSpec] of Object.entries(pkg[section] ?? {})) {
     const spec = String(rawSpec);
+    if (isLocalSpec(name, spec)) continue; // workspace-internal: never flagged, never sent to the registry
     const { target, range } = resolveAlias(name, spec);
     const banned = depConfig.bannedPackages.find((b) => b.name === name || b.name === target);
     if (banned) {
       const alias = target !== name ? ` (alias of "${target}")` : '';
-      hardErrors.push(
-        `[Banned Legacy Dependency] "${name}"${alias} (${spec}) is declared in ${section}. Use ${banned.replacement} instead.`
-      );
+      noteDeclared(`[Banned Legacy Dependency] "${name}"${alias} (${spec}) is declared in ${section}. Use ${banned.replacement} instead.`, manifestLabel);
     }
     const wildcard = range.toLowerCase();
     if (wildcard === '*' || wildcard === 'latest') {
-      hardErrors.push(
-        `[Unpinned Dependency Version] "${name}": "${spec}" in ${section} uses a wildcard. Pin a semver range (e.g. "^1.0.0").`
-      );
+      noteDeclared(`[Unpinned Dependency Version] "${name}": "${spec}" in ${section} uses a wildcard. Pin a semver range (e.g. "^1.0.0").`, manifestLabel);
     }
   }
 }
+for (const [msg, where] of declared) hardErrors.push(`${isMonorepo ? `[${[...where].join(', ')}] ` : ''}${msg}`);
 
 // --- TIER 2: Diff-Aware or Explicit Security & Freshness Audit ---
 const runRegistryAudit = process.argv.includes('--audit') || process.argv.includes('--all');
@@ -181,7 +205,7 @@ const SEVERITY_RANK: Record<string, number> = {
   critical: 4,
 };
 
-const NPM_TIMEOUT_MS = 120_000;
+const NPM_TIMEOUT_MS = depConfig.auditTimeoutMs ?? 30_000;
 const NPM_MAX_BUFFER = 64 * 1024 * 1024;
 
 type NpmResult = { ok: true; stdout: string; status: number | null } | { ok: false; reason: string };
@@ -195,7 +219,13 @@ function runNpm(args: string[]): NpmResult {
     shell: process.platform === 'win32',
   });
   if (r.error) {
-    return { ok: false, reason: `\`npm ${args.join(' ')}\` could not run (${r.error.message})` };
+    const timedOut = (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+    return {
+      ok: false,
+      reason: timedOut
+        ? `\`npm ${args[0]}\` timed out after ${Math.round(NPM_TIMEOUT_MS / 1000)}s (registry unreachable or slow; raise dependencies.auditTimeoutMs)`
+        : `\`npm ${args[0]}\` could not run (${r.error.message})`,
+    };
   }
   return { ok: true, stdout: r.stdout ?? '', status: r.status };
 }
@@ -203,7 +233,10 @@ function runNpm(args: string[]): NpmResult {
 function describeNpmError(error: unknown): string {
   if (error && typeof error === 'object') {
     const e = error as { code?: string; summary?: string };
-    return [e.code, e.summary].filter(Boolean).join(': ') || JSON.stringify(error);
+    return (
+      [e.code, e.summary].filter(Boolean).join(': ') ||
+      'npm returned an error without details (registry unreachable or offline?)'
+    );
   }
   return String(error);
 }
@@ -243,8 +276,36 @@ function resolveLeaves(
   return leaves;
 }
 
+/** Minimal semver compare: true only when `current` is strictly older than `latest`. */
+function isOlder(current: string, latest: string): boolean {
+  const parse = (v: string) => {
+    const m = v.trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([^+]+))?/);
+    return m ? { n: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ?? '' } : null;
+  };
+  const a = parse(current);
+  const b = parse(latest);
+  if (!a || !b) return current !== latest;
+  for (let i = 0; i < 3; i++) if (a.n[i] !== b.n[i]) return a.n[i] < b.n[i];
+  if (a.pre === b.pre) return false;
+  if (!a.pre) return false;
+  if (!b.pre) return true;
+  return a.pre < b.pre;
+}
+
 let auditRan = false;
 let outdatedRan = false;
+const outdatedPolicy: 'major' | 'minor' | 'any' = ['major', 'minor', 'any'].includes((depConfig as any).outdatedPolicy) ? (depConfig as any).outdatedPolicy : 'major';
+const minorBehind: string[] = [];
+const verParts = (v: string): number[] => v.replace(/^[^\d]*/, '').split(/[.+-]/).slice(0, 3).map((x) => Number.parseInt(x, 10) || 0);
+const behindKind = (cur: string, latest: string): 'major' | 'minor' | 'patch' => {
+  const [a, b] = [verParts(cur), verParts(latest)];
+  return b[0] > a[0] ? 'major' : b[1] > a[1] ? 'minor' : 'patch';
+};
+/** Default policy: only a MAJOR behind fails; `minor` also fails on minors; `any` on every newer release. */
+const failsPolicy = (cur: string, latest: string): boolean => {
+  const k = behindKind(cur, latest);
+  return outdatedPolicy === 'any' || k === 'major' || (outdatedPolicy === 'minor' && k === 'minor');
+};
 
 if (runRegistryAudit) {
   // 2A. Security Audit (`npm audit --json`). Exit 1 with a JSON report is normal when vulnerabilities exist.
@@ -348,10 +409,46 @@ if (runRegistryAudit) {
   }
 
   // 2B. Outdated Direct Dependencies (`npm outdated --json`). Exit 1 with JSON is normal when packages are outdated.
-  const outdatedRes = runNpm(['outdated', '--json']);
   let outdated: Record<string, NpmOutdatedEntry | NpmOutdatedEntry[]> | undefined;
   let outdatedFailure = '';
 
+  if (isMonorepo) {
+    // `npm outdated --workspaces` is unreliable (empty report); ask the registry per unique direct package instead.
+    const installed = (name: string): string | undefined => {
+      for (const base of [...manifestDirs, ROOT]) {
+        try {
+          const v = JSON.parse(fs.readFileSync(path.join(base, 'node_modules', name, 'package.json'), 'utf8')).version;
+          if (typeof v === 'string') return v;
+        } catch {
+          /* try next */
+        }
+      }
+      return undefined;
+    };
+    outdated = {};
+    for (const name of [...directNames].sort()) {
+      const res = runNpm(['view', name, 'dist-tags.latest', '--json']);
+      if (!res.ok) {
+        outdated = undefined;
+        outdatedFailure = res.reason;
+        break;
+      }
+      let latest = '';
+      try {
+        const v: unknown = JSON.parse(res.stdout.trim());
+        latest = typeof v === 'string' ? v : '';
+      } catch {
+        latest = res.stdout.trim().replace(/^"|"$/g, '');
+      }
+      if (res.status !== 0 || !/^\d+\.\d+\.\d+/.test(latest)) {
+        outdated = undefined;
+        outdatedFailure = `\`npm view ${name}\` returned no usable "latest" version (exit ${res.status}; registry unreachable?)`;
+        break;
+      }
+      outdated[name] = { current: installed(name), wanted: installed(name), latest };
+    }
+  } else {
+  const outdatedRes = runNpm(['outdated', '--json']);
   if (!outdatedRes.ok) {
     outdatedFailure = outdatedRes.reason;
   } else if (!outdatedRes.stdout.trim()) {
@@ -374,12 +471,14 @@ if (runRegistryAudit) {
       outdatedFailure = `\`npm outdated --json\` returned malformed JSON (exit ${outdatedRes.status})`;
     }
   }
+  }
 
   if (outdatedFailure || !outdated) {
     hardErrors.push(`[Outdated Check Unavailable] audit unavailable: ${outdatedFailure}`);
   } else {
     outdatedRan = true;
     for (const [name, rawInfo] of Object.entries(outdated)) {
+      if (localNames.has(name)) continue;
       for (const info of Array.isArray(rawInfo) ? rawInfo : [rawInfo]) {
         const ackReason = acknowledgedOutdated.get(name);
         if (!info.current) {
@@ -391,9 +490,13 @@ if (runRegistryAudit) {
           } else {
             advisories.push(msg);
           }
-        } else if (info.latest && info.current !== info.latest) {
-          const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}). Run \`npm install ${name}@latest\`.`;
-          if (ackReason) {
+        } else if (name === 'typescript' && info.latest && info.current && Number.parseInt(info.latest, 10) > Math.max(...SUPPORTED_TS_MAJORS)) {
+          advisories.push(`[TypeScript ${info.latest} available] latest major not yet supported by the guardrail checks, pinned to supported range ${SUPPORTED_TS_MAJORS[0]}.x-${Math.max(...SUPPORTED_TS_MAJORS)}.x (installed ${info.current}); informational only.`);
+        } else if (info.latest && isOlder(info.current, info.latest)) {
+          const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}, ${behindKind(info.current, info.latest)} behind). fix: npm install ${name}@latest`;
+          if (!failsPolicy(info.current, info.latest)) {
+            minorBehind.push(`${name} ${info.current} -> ${info.latest}`);
+          } else if (ackReason) {
             acknowledgedNotes.push(
               `[Acknowledged Version Pin] "${name}" (${info.current} vs latest ${info.latest}): ${ackReason}`
             );
@@ -416,6 +519,10 @@ if (uniqueNotes.length > 0) {
   }
 }
 
+if (minorBehind.length > 0) {
+  console.log(`\nℹ️  ${minorBehind.length} dependenc${minorBehind.length === 1 ? 'y is' : 'ies are'} behind by minor/patch only (policy outdatedPolicy: '${outdatedPolicy}', not failing): ${minorBehind.slice(0, 5).join(', ')}${minorBehind.length > 5 ? ', …' : ''}`);
+}
+
 if (advisories.length > 0) {
   console.log(
     `\n🛡️  [Dependency Advisories: moderate or higher below the failure threshold, and notes] (${advisories.length}):`
@@ -428,18 +535,12 @@ if (advisories.length > 0) {
 
 if (hardErrors.length > 0) {
   console.error(
-    `\n❌ Dependency Security & Freshness Guardrail Failed (${hardErrors.length} unacknowledged issue(s)):\n`
+    `\n❌ Dependency Security & Freshness Guardrail Failed (${new Set(hardErrors).size} unacknowledged issue(s)):\n`
   );
-  for (const err of hardErrors) {
+  for (const err of new Set(hardErrors)) {
     console.error(`  • ${err}`);
   }
-  console.error(
-    '\n🔧 Mandatory Resolution Protocol (DO NOT SELF-EXEMPT):\n' +
-      '  1. You MUST actually attempt to upgrade the outdated/vulnerable packages in `package.json` (`npm install <pkg>@latest`) and verify if `npm run build` and `npm run guardrails` pass.\n' +
-      '  2. FORBIDDEN SHORTCUT: Do NOT add entries to `guardrails.config.ts -> dependencies.acknowledgedAdvisories` without testing the upgrade first. Version pins (`kind: "outdated"`) NEVER silence security CVEs (`kind: "cve"`, which require an explicit `ghsaId` and human approval).\n' +
-      '  3. If an upgrade empirically fails during `npm install` or `npm run build`, revert only the broken package upgrade and explicitly warn the user with the exact compiler/peer error and every unresolved CRITICAL/HIGH CVE.\n' +
-      '  4. If the audit is unavailable (no lockfile, offline, registry error), restore the prerequisite (`npm install` to create the lockfile, network access) and re-run; an unavailable audit is never treated as clean.\n'
-  );
+  console.error("\n  fix: upgrade the packages above (`npm install <pkg>@latest`), then re-run `npm run guardrails -- --all`. If the audit is unavailable (no lockfile, offline, registry error) restore that prerequisite; an unavailable audit is never treated as clean. Exceptions need a reason in guardrails.config.ts -> dependencies.acknowledgedAdvisories (CVEs need a ghsaId).\n");
   process.exit(1);
 }
 

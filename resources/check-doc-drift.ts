@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from 'typescript';
-import { guardrailsConfig } from '../guardrails.config.ts';
+import { ts } from './ts-api.ts';
+import { ROOT as REPO_ROOT, guardrailsConfig, isMonorepo, projects } from './context.ts';
+import { checkDocClaims } from './doc-claims.ts';
+import { walk as walkAll } from './source-utils.ts';
+import { interactiveFiles } from './interactive.ts';
 
 /**
  * Automated Doc-Drift & Astro Structural Guardrail Checker (scripts/check-doc-drift.ts)
@@ -29,8 +32,7 @@ import { guardrailsConfig } from '../guardrails.config.ts';
  *    every wrapper under `storyblok.wrapperDir` must contain an actual `storyblokEditable(<identifier>)` call.
  */
 
-const ROOT = process.cwd();
-const errors: string[] = [];
+const allErrors: string[] = [];
 
 const MODULE_EXTENSIONS = /\.(ts|tsx|mts|astro|js|jsx|mjs)$/;
 
@@ -46,7 +48,7 @@ function walkFiles(dir: string, accept: (name: string) => boolean, rel = ''): st
     if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
     const relPath = rel ? `${rel}/${entry.name}` : entry.name;
     if (entry.isDirectory()) out.push(...walkFiles(dir, accept, relPath));
-    else if (entry.name !== 'AGENTS.md' && accept(entry.name)) out.push(relPath);
+    else if (entry.name !== 'AGENTS.md' && entry.name !== '_AGENTS.md' && accept(entry.name)) out.push(relPath);
   }
   return out.sort();
 }
@@ -192,6 +194,11 @@ function braceGroups(template: string): string[] {
   return groups;
 }
 
+// Sections 1-6 run once per project (every workspace in monorepo mode; the repo root otherwise).
+// The Playwright spec path is always relative to the repo root.
+function checkProject(ROOT: string, label: string): void {
+const errors = { push: (m: string) => allErrors.push(label ? `${m} [in ${label}]` : m) };
+
 // 1. Check module files <-> scoped AGENTS.md
 function exportedModulesSection(agentsMd: string): string {
   const lines = agentsMd.split('\n');
@@ -204,10 +211,13 @@ function exportedModulesSection(agentsMd: string): string {
 
 for (const modDir of guardrailsConfig.scopedModules) {
   const absDir = path.join(ROOT, modDir);
-  const agentsMdPath = path.join(absDir, 'AGENTS.md');
+  // Under src/pages an `AGENTS.md` would be compiled into a route (`/AGENTS`): use `_AGENTS.md` there (underscore files are not routed).
+  const agentsMdPath = ['AGENTS.md', '_AGENTS.md'].map((n) => path.join(absDir, n)).find((f) => fs.existsSync(f)) ?? path.join(absDir, 'AGENTS.md');
 
+  // Monorepo workspaces only have the modules they actually contain.
+  if (isMonorepo && !fs.existsSync(absDir)) continue;
   if (!fs.existsSync(agentsMdPath)) {
-    errors.push(`[Missing Scoped Context] ${modDir}/AGENTS.md does not exist.`);
+    errors.push(`[Missing Scoped Context] ${modDir}/AGENTS.md does not exist${/(^|\/)src\/pages(\/|$)/.test(modDir) ? ' (under src/pages use _AGENTS.md: a plain AGENTS.md becomes the route /AGENTS)' : ''}.`);
     continue;
   }
 
@@ -218,6 +228,7 @@ for (const modDir of guardrailsConfig.scopedModules) {
   );
 
   for (const file of actualFiles) {
+    if (/\.(test|spec)\.[^/]*$/.test(file)) continue; // co-located tests need no registry entry
     if (!documentedFiles.includes(file)) {
       errors.push(
         `[Doc Drift: Undocumented File] "${modDir}/${file}" exists in code but is not listed (as a path relative to ${modDir}) under "## Exported Modules" in ${modDir}/AGENTS.md.`
@@ -229,6 +240,22 @@ for (const modDir of guardrailsConfig.scopedModules) {
     if (!fs.existsSync(path.join(absDir, docFile))) {
       errors.push(
         `[Doc Drift: Ghost Entry] "${docFile}" is documented in ${modDir}/AGENTS.md, but "${modDir}/${docFile}" does not exist on disk.`
+      );
+    }
+  }
+}
+
+// 1b. Markdown under src/pages is compiled into a route: only `_`-prefixed files (not routed) or pages with a `layout:` are intended.
+{
+  const pagesDir = path.join(ROOT, 'src/pages');
+  if (fs.existsSync(pagesDir)) {
+    for (const abs of walkAll(pagesDir, { accept: (n: string) => /\.md$/i.test(n) })) {
+      const rel = toPosix(path.relative(pagesDir, abs));
+      if (rel.split('/').some((seg) => seg.startsWith('_'))) continue;
+      if (/^---\n[\s\S]*?\blayout\s*:/.test(readText(abs))) continue;
+      const route = '/' + rel.replace(/\.md$/i, '').replace(/\/?index$/, '');
+      errors.push(
+        `[Accidental Route] ${toPosix(path.relative(REPO_ROOT, abs))}:1 is a .md file under src/pages, so Astro serves it as the route "${route}". Move it outside src/pages (e.g. the app root) or rename it with a leading underscore (_${path.basename(abs)}); a markdown page that is meant to be served needs a \`layout:\` frontmatter.`
       );
     }
   }
@@ -270,7 +297,7 @@ function adrReferencePaths(frontmatter: string): string[] {
 
 const adrDir = path.join(ROOT, 'docs/adr');
 if (fs.existsSync(adrDir)) {
-  const adrFiles = fs.readdirSync(adrDir).filter((f) => f.endsWith('.md'));
+  const adrFiles = fs.readdirSync(adrDir).filter((f) => f.endsWith('.md') && f.toLowerCase() !== 'agents.md');
   for (const adrFile of adrFiles) {
     const frontmatterMatch = readText(path.join(adrDir, adrFile)).match(/^---\n([\s\S]*?)\n---/);
     if (!frontmatterMatch) {
@@ -308,12 +335,21 @@ function specLiterals(specSource: string, fileName: string): string[] {
   return literals;
 }
 
+/**
+ * Selector forms that count as "this control is exercised by the spec" (any one per interactive file is enough):
+ *  - `data-*="v"` / `id="v"` / `aria-label="v"`: `getByTestId('v')`, `[data-testid="v"]`, `[data-testid=v]`, `#v`, `getByLabel('v')`, `{ name: 'v' }`
+ *  - `class="a b"`: `.a` in a CSS selector literal, or the class name as a quoted string
+ *  - `role="r"`: `getByRole('r')` or `[role=r]`
+ * Dynamic values (`{...}`) are ignored. Comments in the spec do not count.
+ */
 function selectorValues(content: string): string[] {
   const values = new Set<string>();
-  const attr = /\b(id|data-[a-z0-9-]+|aria-label)=(?:"([^"]+)"|'([^']+)')/gi;
+  const attr = /\b(id|data-[a-z0-9-]+|aria-label|role|class)=(?:"([^"]+)"|'([^']+)')/gi;
   for (const m of content.matchAll(attr)) {
     const value = m[2] ?? m[3];
-    if (!value.includes('{')) values.add(value);
+    if (value.includes('{')) continue;
+    if (m[1].toLowerCase() === 'class') for (const token of value.split(/\s+/)) token && values.add(token);
+    else values.add(value.trim());
   }
   return [...values];
 }
@@ -321,21 +357,42 @@ function selectorValues(content: string): string[] {
 function isValueReferenced(literals: string[], value: string): boolean {
   const esc = escapeRegExp(value);
   const idForm = new RegExp(`#${esc}(?![\\w-])`);
+  const classForm = new RegExp(`\\.${esc}(?![\\w-])`);
+  const unquotedAttr = new RegExp(`=\\s*${esc}(?![\\w-])`);
   const wordForm = new RegExp(`(?<![\\w-])${esc}(?![\\w-])`);
+  const lower = value.toLowerCase();
   return literals.some(
     (lit) =>
       lit === value ||
+      lit.toLowerCase() === lower ||
       lit.includes(`"${value}"`) ||
       lit.includes(`'${value}'`) ||
       idForm.test(lit) ||
+      classForm.test(lit) ||
+      unquotedAttr.test(lit) ||
       (lit.startsWith('/') && wordForm.test(lit))
   );
 }
 
-// 3. Import boundaries & 5. Interactive UI coverage in src/ui/
-const specPath = guardrailsConfig.visualSpecPath;
-const specAbs = specPath ? path.join(ROOT, specPath) : null;
-const specLits = specAbs && fs.existsSync(specAbs) ? specLiterals(readText(specAbs), specAbs) : null;
+/** `visualSpecPath` may be a file, a glob (`packages/qa/tests/**\/*.spec.ts`) or an array of those. */
+function resolveSpecFiles(spec: string | string[] | null | undefined): string[] {
+  const out = new Set<string>();
+  for (const entry of Array.isArray(spec) ? spec : spec ? [spec] : []) {
+    if (!/[*?]/.test(entry)) {
+      const abs = path.join(REPO_ROOT, entry);
+      if (fs.existsSync(abs)) out.add(abs);
+      continue;
+    }
+    const re = new RegExp('^' + entry.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*\//g, '\u0000').replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\u0000/g, '(?:.*/)?').replace(/\u0001/g, '.*') + '$');
+    const base = path.join(REPO_ROOT, entry.split('*')[0].replace(/[^/]*$/, ''));
+    for (const abs of walkAll(base, { accept: (n: string) => /\.[cm]?[jt]sx?$/.test(n) })) if (re.test(toPosix(path.relative(REPO_ROOT, abs)))) out.add(abs);
+  }
+  return [...out];
+}
+const specPath = guardrailsConfig.visualSpecPath as string | string[] | null | undefined;
+const specLabel = Array.isArray(specPath) ? specPath.join(', ') : specPath;
+const specFiles = resolveSpecFiles(specPath);
+const specLits = specFiles.length > 0 ? specFiles.flatMap((f) => specLiterals(readText(f), f)) : null;
 let reportedMissingSpec = false;
 
 const uiDir = path.join(ROOT, 'src/ui');
@@ -348,22 +405,32 @@ if (fs.existsSync(uiDir)) {
         `[Astro Boundary Violation] src/ui/${file} imports "${spec}". ADR-0001 forbids src/ui/ from importing worker, pages, storyblok wrappers, or CMS adapter internals.`
       );
     }
+  }
+}
 
-    if (specPath && /<(button|script)\b/i.test(content)) {
+// Selector coverage: this project's src (any folder), the same file set as interactiveFiles() across all projects.
+if (specPath) {
+  {
+    for (const abs of walkAll(path.join(ROOT, 'src'), { accept: isAstroFile })) {
+      const content = readText(abs);
+      if (!/<(button|script)\b|\bclient:(?:load|idle|visible|media|only)\b/i.test(content)) continue;
+      const rel = toPosix(path.relative(REPO_ROOT, abs));
       if (specLits === null) {
         if (!reportedMissingSpec) {
           reportedMissingSpec = true;
           errors.push(
-            `[Missing Visual Spec] visualSpecPath is configured as "${specPath}" but the file does not exist, so interactive UI (e.g. src/ui/${file}) cannot be verified. Create the spec or set visualSpecPath to null.`
+            `[Missing Visual Spec] visualSpecPath is configured as "${specLabel}" but matches no spec file, so interactive UI (e.g. ${rel}) cannot be verified. Create the spec or set visualSpecPath to null.`
           );
         }
         continue;
       }
       const selectors = selectorValues(content);
+      // script-only components (no controls, no selectors) have nothing a spec could target
+      if (selectors.length === 0 && !/<button\b|\bclient:(?:load|idle|visible|media|only)\b/i.test(content)) continue;
       if (!selectors.some((value) => isValueReferenced(specLits, value))) {
         const hint = selectors.length === 0 ? ' Add a stable `data-testid="..."` to the control and test it.' : '';
         errors.push(
-          `[Untested Interactive UI] src/ui/${file} contains interactive controls (<button>/<script>), but none of its selector values (${selectors.join(', ') || 'none'}) are referenced in ${specPath}.${hint}`
+          `[Untested Interactive UI] ${rel} contains interactive controls (<button>/<script>/client:*), but none of its selector values (${selectors.join(', ') || 'none'}) are referenced in ${specLabel}.${hint}`
         );
       }
     }
@@ -421,16 +488,51 @@ if (guardrailsConfig.storyblok?.requireStoryblokEditable) {
     }
   }
 }
+} // end checkProject
 
-if (errors.length > 0) {
+// In monorepo mode the repo root is checked too (it owns docs/adr).
+if (isMonorepo) checkProject(REPO_ROOT, '');
+for (const project of projects) checkProject(project.abs, project.dir);
+
+// ---------- Cross-cutting documentation claims (AGENTS.md / README.md / ADR) ----------
+const requireAdr = guardrailsConfig.requireAdr ?? isMonorepo;
+allErrors.push(
+  ...checkDocClaims({
+    root: REPO_ROOT,
+    projects: projects.map((p) => ({ dir: p.dir, abs: p.abs, name: p.name })),
+    isMonorepo,
+    scopedModules: guardrailsConfig.scopedModules ?? [],
+    requireAdr,
+    allow: (guardrailsConfig as any).docClaimsAllow ?? [],
+    plannedPathDirs: (guardrailsConfig as any).plannedPathDirs,
+  })
+);
+
+if (!guardrailsConfig.visualSpecPath) {
+  console.log('⏭️  Interactive selector sync SKIPPED: visualSpecPath is not configured (no Playwright spec to compare against).');
+  const interactive = interactiveFiles();
+  const requireSpecs = guardrailsConfig.requireInteractiveSpecs ?? isMonorepo;
+  for (const f of interactive) {
+    const msg = `${f.file}:${f.line} has interactive behaviour (${f.what}) but no spec covers it (visualSpecPath is null).`;
+    if (requireSpecs) {
+      allErrors.push(
+        `[Interactive Behaviour Without Spec] ${msg} Set visualSpecPath to a Playwright spec (and install @playwright/test), or set requireInteractiveSpecs: false to accept the gap.`
+      );
+    } else {
+      console.log(`ℹ️  [Advisory] ${msg}`);
+    }
+  }
+}
+
+if (allErrors.length > 0) {
   console.error('\n❌ Guardrail & Doc-Drift Check Failed:\n');
-  for (const err of errors) {
+  for (const err of allErrors) {
     console.error(`  • ${err}`);
   }
   console.error('\nFix the violation above and re-run `npm run guardrails`.\n');
   process.exit(1);
 } else {
   console.log(
-    '✅ Doc-Drift & Astro Structural Guardrails Passed: Code, scoped AGENTS.md files, ADRs, and interactive UI selectors are in sync.'
+    `✅ Doc-Drift & Astro Structural Guardrails Passed: Code, scoped AGENTS.md files, ADRs and documented paths/commands are in sync${guardrailsConfig.visualSpecPath ? ', and interactive UI selectors are covered' : ' (interactive selector sync skipped)'}.`
   );
 }

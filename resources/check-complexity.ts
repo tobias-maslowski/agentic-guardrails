@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from 'typescript';
-import { guardrailsConfig } from '../guardrails.config.ts';
+import { ts } from './ts-api.ts';
+import { ROOT, guardrailsConfig, isMonorepo, projects } from './context.ts';
 import { getChangedFiles } from './git-changes.ts';
+import { DEFAULT_TEST_GLOBS } from './defaults.ts';
 
 /**
  * AST Code Complexity & Architectural Smell Advisor (scripts/check-complexity.ts)
@@ -24,6 +25,8 @@ import { getChangedFiles } from './git-changes.ts';
  *    `typeof window` guards are not flagged.
  * 5. Cross-File AST Clone Detection: Detects copy-pasted executable statement blocks across files.
  * 6. Inline Type-Cast Escapes: Flags `as any`, `as unknown as`, and inline structural casts `as { ... }`.
+ * 8. Function Clone Detection: normalized function bodies (identifiers and literals ignored) that are
+ *    identical or near-identical (token-shingle Jaccard) across different files/workspaces.
  * 7. Untyped Public Runtime Scripts (`public/*.js`): Scans raw JS scripts in `public/` and warns
  *    when runtime logic lives outside TypeScript & AGENTS.md governance.
  *
@@ -36,7 +39,6 @@ import { getChangedFiles } from './git-changes.ts';
  * `failOnComplexityAdvisories: true`, exits 1 when any advisory remains after ratchet filtering.
  */
 
-const ROOT = process.cwd();
 const {
   functionCognitive: ADVISORY_COGNITIVE_THRESHOLD,
   functionCyclomatic: ADVISORY_CYCLOMATIC_THRESHOLD,
@@ -622,6 +624,106 @@ function collectStatementWindows(
   return windows;
 }
 
+interface CloneUnit {
+  file: string;
+  line: number;
+  name: string;
+  tokens: string[];
+  shingles: Set<string>;
+}
+const cloneUnits: CloneUnit[] = [];
+const CLONE_MIN_STATEMENTS = 6;
+const CLONE_MIN_TOKENS = 60;
+const SHINGLE = 8;
+
+function normalizedTokens(node: ts.Node): string[] {
+  const out: string[] = [];
+  const visit = (n: ts.Node) => {
+    if (ts.isIdentifier(n) || ts.isPrivateIdentifier(n)) out.push('ID');
+    else if (
+      ts.isStringLiteralLike(n) ||
+      ts.isNumericLiteral(n) ||
+      ts.isBigIntLiteral(n) ||
+      ts.isRegularExpressionLiteral(n) ||
+      ts.isTemplateHead(n) ||
+      ts.isTemplateMiddle(n) ||
+      ts.isTemplateTail(n)
+    )
+      out.push('LIT');
+    else out.push(String(n.kind));
+    ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return out;
+}
+
+function recordCloneCandidate(
+  node: ts.Node,
+  sourceFile: ts.SourceFile,
+  relFile: string,
+  name: string,
+  lineOffset: number
+): void {
+  const body = (node as { body?: ts.Node }).body;
+  if (!body || !ts.isBlock(body)) return;
+  const tokens = normalizedTokens(body);
+  if (body.statements.length < CLONE_MIN_STATEMENTS && tokens.length < CLONE_MIN_TOKENS) return;
+  const shingles = new Set<string>();
+  for (let i = 0; i + SHINGLE <= tokens.length; i++) shingles.add(tokens.slice(i, i + SHINGLE).join(','));
+  cloneUnits.push({
+    file: relFile,
+    line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1 + lineOffset,
+    name,
+    tokens,
+    shingles,
+  });
+}
+
+function detectFunctionClones(threshold = 0.85, cap = 4000): CodeSmellAdvisory[] {
+  const units = cloneUnits.slice(0, cap);
+  const parent = units.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const similar = new Map<string, number>();
+  for (let i = 0; i < units.length; i++) {
+    for (let j = i + 1; j < units.length; j++) {
+      const a = units[i];
+      const b = units[j];
+      if (a.file === b.file) continue;
+      const lo = Math.min(a.tokens.length, b.tokens.length);
+      const hi = Math.max(a.tokens.length, b.tokens.length);
+      if (lo / hi < 0.7) continue;
+      let score: number;
+      if (a.tokens.length === b.tokens.length && a.tokens.join(',') === b.tokens.join(',')) score = 1;
+      else {
+        let inter = 0;
+        for (const sh of a.shingles) if (b.shingles.has(sh)) inter++;
+        const union = a.shingles.size + b.shingles.size - inter;
+        score = union === 0 ? 0 : inter / union;
+      }
+      if (score >= threshold) {
+        parent[find(i)] = find(j);
+        similar.set(`${i}:${j}`, score);
+      }
+    }
+  }
+  const groups = new Map<number, CloneUnit[]>();
+  units.forEach((u, i) => groups.set(find(i), [...(groups.get(find(i)) ?? []), u]));
+  const out: CodeSmellAdvisory[] = [];
+  for (const group of groups.values()) {
+    if (new Set(group.map((g) => g.file)).size < 2) continue;
+    const locations = group.map((g) => `${g.file}:${g.line} (${g.name})`).join(' and ');
+    out.push({
+      file: group[0].file,
+      line: group[0].line,
+      files: Array.from(new Set(group.map((g) => g.file))),
+      category: 'Cross-File Function Clone',
+      summary: `Near-identical function bodies (names and literals ignored): ${locations}.`,
+      advice: 'Extract the shared logic into one helper (in a shared package when the copies live in different workspaces).',
+    });
+  }
+  return out;
+}
+
 function analyzeCodeSnippet(
   code: string,
   relFile: string,
@@ -671,6 +773,7 @@ function analyzeCodeSnippet(
   }
 
   const addUnit = (node: ts.Node, unitName: string) => {
+    recordCloneCandidate(node, sourceFile, relFile, unitName, lineOffset);
     units.push(
       analyzeAstUnit(node, sourceFile, relFile, unitName, 'function', lineOffset, false)
     );
@@ -791,15 +894,18 @@ const declarativeFiles: string[] = [];
 let smellAdvisories: CodeSmellAdvisory[] = [];
 const allFingerprints: StatementFingerprint[] = [];
 
-const scanDirs = Array.from(
-  new Set([
-    ...guardrailsConfig.scopedModules,
-    ...(guardrailsConfig.extraComplexityScanDirs ?? ['src/pages', 'public']),
-  ])
-);
+const dirsFor = (base: string): string[] =>
+  [
+    ...(guardrailsConfig.scopedModules ?? []),
+    ...(guardrailsConfig.extraComplexityScanDirs ?? (isMonorepo ? ['src', 'public'] : ['src/pages', 'public'])),
+  ].map((d) => toPosix(path.join(base, d)));
+const scanDirs = Array.from(new Set(projects.flatMap((p) => dirsFor(p.dir === '' ? '.' : p.dir)).map((d) => d.replace(/^\.\//, ''))));
+const scanned = new Set<string>();
 
 for (const dir of scanDirs) {
   for (const relFile of collectFiles(dir)) {
+    if (scanned.has(relFile)) continue;
+    scanned.add(relFile);
     const raw = fs.readFileSync(path.join(ROOT, relFile), 'utf8').replace(/\r\n/g, '\n');
     if (/\.(ts|tsx|mts)$/.test(relFile)) {
       const { units, castSmells, fingerprints } = analyzeCodeSnippet(raw, relFile, 'ts', 0);
@@ -810,14 +916,14 @@ for (const dir of scanDirs) {
       } else {
         allUnits.push(...units);
       }
-    } else if (relFile.endsWith('.js') && relFile.startsWith('public/')) {
+    } else if (relFile.endsWith('.js') && /(^|\/)public\//.test(relFile)) {
       const { units } = analyzeCodeSnippet(raw, relFile, 'public-js', 0);
       allUnits.push(...units);
 
-      const rootAgentsPath = path.join(ROOT, 'AGENTS.md');
-      const rootAgentsMd = fs.existsSync(rootAgentsPath)
-        ? fs.readFileSync(rootAgentsPath, 'utf8')
-        : '';
+      const owner = projects.find((p) => p.dir !== '' && relFile.startsWith(p.dir + '/'));
+      const rootAgentsMd = [path.join(ROOT, 'AGENTS.md'), ...(owner ? [path.join(owner.abs, 'AGENTS.md')] : [])]
+        .map((f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : ''))
+        .join('\n');
       if (!rootAgentsMd.includes(relFile) && !rootAgentsMd.includes('public/')) {
         smellAdvisories.push({
           file: relFile,
@@ -889,6 +995,8 @@ for (const [, group] of fingerprintGroups) {
   }
 }
 
+smellAdvisories.push(...detectFunctionClones());
+
 for (const u of allUnits) {
   if (
     u.kind === 'astro-script' &&
@@ -923,13 +1031,21 @@ if (changedSet !== null) {
   smellAdvisories = smellAdvisories.filter((a) => (a.files ?? [a.file]).some((f) => changedSet.has(f)));
 }
 
-const reportedUnits = changedSet === null ? allUnits : allUnits.filter((u) => changedSet.has(u.file));
-const reportedDeclarative =
-  changedSet === null ? declarativeFiles : declarativeFiles.filter((f) => changedSet.has(f));
+// Test files (config testGlobs) are not production code: no advisories, no scorecard rows.
+const testRes = ((guardrailsConfig.testGlobs as string[] | undefined) ?? DEFAULT_TEST_GLOBS).map(
+  (g) => new RegExp('^' + g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*\*\//g, '\u0000').replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\u0000/g, '(?:.*/)?').replace(/\u0001/g, '.*') + '$')
+);
+const isTestFile = (f: string): boolean => testRes.some((re) => re.test(toPosix(f)));
+smellAdvisories = smellAdvisories.filter((a) => !(a.files ?? [a.file]).every(isTestFile));
+const verbose = process.argv.includes('--verbose');
+
+const productionUnits = allUnits.filter((u) => !isTestFile(u.file));
+const reportedUnits = changedSet === null ? productionUnits : productionUnits.filter((u) => changedSet.has(u.file));
+const reportedDeclarative = (changedSet === null ? declarativeFiles : declarativeFiles.filter((f) => changedSet.has(f))).filter((f) => !isTestFile(f));
 
 console.log('\n📊 AST Complexity & Architectural Smell Scorecard (Declarative Data & CSS Ignored):');
 console.log(
-  `   • Pure Declarative Modules (CC=1, CogC=0): ${reportedDeclarative.join(', ') || 'none'}`
+  `   • Pure Declarative Modules (CC=1, CogC=0): ${reportedDeclarative.length > 5 && !verbose ? `${reportedDeclarative.slice(0, 5).join(', ')} (+${reportedDeclarative.length - 5} more)` : reportedDeclarative.join(', ') || 'none'}`
 );
 
 const sortedUnits = [...reportedUnits].sort(
@@ -955,7 +1071,9 @@ if (smellAdvisories.length > 0) {
   console.log(
     `\n💡 [Architectural & Complexity Advisories] (${smellAdvisories.length} finding(s)):`
   );
-  for (const adv of smellAdvisories) {
+  const shownAdvisories = verbose ? smellAdvisories : smellAdvisories.slice(0, 5);
+  if (!verbose && smellAdvisories.length > 5) console.log(`  (showing the top 5 of ${smellAdvisories.length}; run this script with --verbose for all (test files are excluded via testGlobs)`);
+  for (const adv of shownAdvisories) {
     console.log(
       `  • [${adv.category}] ${adv.file}:${adv.line}\n    ↳ Smell:  ${adv.summary}\n    ↳ Advice: ${adv.advice}`
     );
