@@ -1,25 +1,39 @@
-import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 import { guardrailsConfig } from '../guardrails.config.ts';
+import { getChangedFiles } from './git-changes.ts';
 
 /**
  * AST Code Complexity & Architectural Smell Advisor (scripts/check-complexity.ts)
  *
  * Configured via `guardrails.config.ts`. Uses the TypeScript Compiler AST (`ts.createSourceFile`)
  * and Astro template analysis to detect:
- * 1. Function Cognitive & Cyclomatic Complexity (SonarSource CogC & CC).
+ * 1. Function Cognitive & Cyclomatic Complexity for functions, class methods, constructors,
+ *    accessors, object-literal methods and (exported/default) arrow functions. CogC and CC here are
+ *    simplified approximations of SonarSource Cognitive Complexity and McCabe Cyclomatic Complexity,
+ *    not exact reimplementations; treat the numbers as relative signals.
  * 2. Fat Inline Astro <script> Smell: Inline <script> blocks in .astro templates should be
  *    thin DOM wiring glue; business/rendering logic belongs in .ts modules.
  * 3. SSR <-> Client Dual-Render Duplication Smell: Detects when an .astro client <script>
  *    uses `.innerHTML` to rebuild the exact same CSS classes/markup already rendered in SSR.
  * 4. SSR Frontmatter Runtime Impurity: Detects when an .astro SSR frontmatter (`---`) imports
- *    a `.ts` module that references browser-only DOM globals (`document`, `window`, `navigator`, `HTMLElement`).
+ *    (directly, or transitively through local imports) a module that references browser-only DOM
+ *    globals (`document`, `window`, `navigator`, `HTMLElement`, also via `globalThis.*`). Detection is
+ *    scope-aware: property names, object keys, local bindings, type positions and
+ *    `typeof window` guards are not flagged.
  * 5. Cross-File AST Clone Detection: Detects copy-pasted executable statement blocks across files.
  * 6. Inline Type-Cast Escapes: Flags `as any`, `as unknown as`, and inline structural casts `as { ... }`.
  * 7. Untyped Public Runtime Scripts (`public/*.js`): Scans raw JS scripts in `public/` and warns
  *    when runtime logic lives outside TypeScript & AGENTS.md governance.
+ *
+ * Ratchet mode (`ratchetChangedFilesOnly`) limits advisories AND the scorecard to files reported by
+ * `getChangedFiles` (`--base <ref>` also includes files changed since that ref). If git is
+ * unavailable, a warning is printed and all files are analysed. Cross-file clone advisories are kept
+ * when ANY participating file changed.
+ *
+ * Exit code: 0 by default (advisories are informational). With
+ * `failOnComplexityAdvisories: true`, exits 1 when any advisory remains after ratchet filtering.
  */
 
 const ROOT = process.cwd();
@@ -54,6 +68,8 @@ interface CodeSmellAdvisory {
     | 'Untyped Public Runtime Script';
   summary: string;
   advice: string;
+  /** Every file participating in the finding (cross-file clones); defaults to `file`. */
+  files?: string[];
 }
 
 interface StatementFingerprint {
@@ -74,23 +90,254 @@ const BROWSER_ONLY_GLOBALS = new Set([
   'Document',
 ]);
 
+const toPosix = (p: string) => p.split(path.sep).join('/').replace(/\\/g, '/');
+
+function getBaseArg(): string | undefined {
+  const argv = process.argv.slice(2);
+  const eq = argv.find((a) => a.startsWith('--base='));
+  if (eq) return eq.slice('--base='.length) || undefined;
+  const idx = argv.indexOf('--base');
+  return idx >= 0 ? argv[idx + 1] : undefined;
+}
+
 function getGitChangedFilesSet(): Set<string> | null {
   if (!guardrailsConfig.ratchetChangedFilesOnly) return null;
-  try {
-    const out = execSync('git status --porcelain', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return new Set(
-      out
-        .split('\n')
-        .map((line) => line.slice(3).trim())
-        .filter(Boolean)
-        .flatMap((entry) => entry.split(' -> '))
+  const files = getChangedFiles({ cwd: ROOT, base: getBaseArg() });
+  if (files === null) {
+    console.warn(
+      '⚠️  Ratchet mode is enabled but git is unavailable: analysing ALL files instead of only changed ones.'
     );
-  } catch {
     return null;
   }
+  return new Set(files.map(toPosix));
+}
+
+const BROWSER_GLOBAL_ADVICE =
+  'Keep modules imported in Astro SSR frontmatter (`---`) 100% isomorphic (Edge/Worker safe). Separate pure projection/math helpers from browser DOM controllers (`document`, `navigator`, `HTMLElement`), which should only be imported inside `<script>`.';
+
+function scriptKindFor(file: string): ts.ScriptKind {
+  if (file.endsWith('.tsx')) return ts.ScriptKind.TSX;
+  if (file.endsWith('.js') || file.endsWith('.mjs')) return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
+}
+
+function bindingNames(name: ts.BindingName, out: Set<string>) {
+  if (ts.isIdentifier(name)) {
+    out.add(name.text);
+    return;
+  }
+  for (const el of name.elements) {
+    if (ts.isBindingElement(el)) bindingNames(el.name, out);
+  }
+}
+
+function collectHoistedVars(node: ts.Node, out: Set<string>) {
+  if (ts.isVariableDeclaration(node)) bindingNames(node.name, out);
+  if (ts.isFunctionLike(node) || ts.isClassLike(node)) return;
+  ts.forEachChild(node, (c) => collectHoistedVars(c, out));
+}
+
+function collectStatementDeclarations(statements: readonly ts.Statement[], out: Set<string>) {
+  for (const st of statements) {
+    if (ts.isVariableStatement(st)) {
+      for (const d of st.declarationList.declarations) bindingNames(d.name, out);
+    } else if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) {
+      out.add(st.name.text);
+    } else if (ts.isImportDeclaration(st) && st.importClause) {
+      const clause = st.importClause;
+      if (clause.name) out.add(clause.name.text);
+      const nb = clause.namedBindings;
+      if (nb && ts.isNamespaceImport(nb)) out.add(nb.name.text);
+      else if (nb) for (const el of nb.elements) out.add(el.name.text);
+    } else if (ts.isImportEqualsDeclaration(st)) {
+      out.add(st.name.text);
+    }
+  }
+}
+
+const declaredNamesCache = new WeakMap<ts.Node, Set<string>>();
+
+function declaredNames(scope: ts.Node): Set<string> {
+  const cached = declaredNamesCache.get(scope);
+  if (cached) return cached;
+  const names = new Set<string>();
+  if (ts.isSourceFile(scope)) {
+    collectStatementDeclarations(scope.statements, names);
+    collectHoistedVars(scope, names);
+  } else if (ts.isBlock(scope) || ts.isModuleBlock(scope)) {
+    collectStatementDeclarations(scope.statements, names);
+  } else if (ts.isCaseBlock(scope)) {
+    for (const clause of scope.clauses) collectStatementDeclarations(clause.statements, names);
+  } else if (ts.isFunctionLike(scope)) {
+    for (const p of scope.parameters) bindingNames(p.name, names);
+    if (ts.isFunctionExpression(scope) && scope.name) names.add(scope.name.text);
+    if ('body' in scope && scope.body) collectHoistedVars(scope.body, names);
+  } else if (ts.isClassExpression(scope) && scope.name) {
+    names.add(scope.name.text);
+  } else if (ts.isCatchClause(scope) && scope.variableDeclaration) {
+    bindingNames(scope.variableDeclaration.name, names);
+  } else if (
+    (ts.isForStatement(scope) || ts.isForInStatement(scope) || ts.isForOfStatement(scope)) &&
+    scope.initializer &&
+    ts.isVariableDeclarationList(scope.initializer)
+  ) {
+    for (const d of scope.initializer.declarations) bindingNames(d.name, names);
+  }
+  declaredNamesCache.set(scope, names);
+  return names;
+}
+
+function isLocallyDeclared(id: ts.Identifier): boolean {
+  for (let p: ts.Node | undefined = id.parent; p; p = p.parent) {
+    if (declaredNames(p).has(id.text)) return true;
+  }
+  return false;
+}
+
+function isInTypePosition(node: ts.Node): boolean {
+  for (let p: ts.Node | undefined = node.parent; p; p = p.parent) {
+    if (ts.isInterfaceDeclaration(p) || ts.isTypeAliasDeclaration(p)) return true;
+    if (ts.isExpressionWithTypeArguments(p)) {
+      const heritage = p.parent;
+      // `class A extends HTMLElement` is a runtime reference; `implements` is type-only.
+      if (ts.isHeritageClause(heritage) && heritage.token === ts.SyntaxKind.ExtendsKeyword && ts.isClassLike(heritage.parent)) {
+        return false;
+      }
+      return true;
+    }
+    if (ts.isTypeNode(p)) return true;
+    if (ts.isStatement(p) || ts.isSourceFile(p)) return false;
+  }
+  return false;
+}
+
+function isNonReferenceName(id: ts.Identifier): boolean {
+  const p = id.parent;
+  if (ts.isPropertyAccessExpression(p) && p.name === id) return true;
+  if (ts.isQualifiedName(p) && p.right === id) return true;
+  if (
+    (ts.isPropertyAssignment(p) ||
+      ts.isPropertySignature(p) ||
+      ts.isPropertyDeclaration(p) ||
+      ts.isMethodDeclaration(p) ||
+      ts.isMethodSignature(p) ||
+      ts.isGetAccessorDeclaration(p) ||
+      ts.isSetAccessorDeclaration(p) ||
+      ts.isEnumMember(p)) &&
+    p.name === id
+  ) {
+    return true;
+  }
+  if (ts.isBindingElement(p) && p.propertyName === id) return true;
+  if (ts.isImportSpecifier(p) || ts.isExportSpecifier(p)) return true;
+  if (ts.isLabeledStatement(p) || ts.isBreakOrContinueStatement(p)) return true;
+  // `typeof window !== 'undefined'` is a guard, not a use.
+  if (ts.isTypeOfExpression(p)) return true;
+  return false;
+}
+
+function conditionGuardsGlobal(cond: ts.Expression, name: string): boolean {
+  let found = false;
+  const visit = (n: ts.Node) => {
+    if (ts.isTypeOfExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === name) found = true;
+    if (!found) ts.forEachChild(n, visit);
+  };
+  visit(cond);
+  return found;
+}
+
+function isGuardedByTypeof(node: ts.Node, name: string): boolean {
+  for (let child: ts.Node = node, p = node.parent; p; child = p, p = p.parent) {
+    if (ts.isFunctionLike(p) && !ts.isArrowFunction(p)) return false;
+    if (ts.isIfStatement(p) && p.thenStatement === child && conditionGuardsGlobal(p.expression, name)) return true;
+    if (ts.isConditionalExpression(p) && p.whenTrue === child && conditionGuardsGlobal(p.condition, name)) return true;
+    if (
+      ts.isBinaryExpression(p) &&
+      p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken &&
+      p.right === child &&
+      conditionGuardsGlobal(p.left, name)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Browser-only globals referenced at runtime and not resolved to a local declaration. */
+function findBrowserGlobalRefs(sf: ts.SourceFile): Map<string, number> {
+  const found = new Map<string, number>();
+  const record = (name: string, node: ts.Node) => {
+    if (found.has(name)) return;
+    found.set(name, sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1);
+  };
+
+  function visit(node: ts.Node) {
+    if (ts.isIdentifier(node)) {
+      if (
+        BROWSER_ONLY_GLOBALS.has(node.text) &&
+        !isNonReferenceName(node) &&
+        !isInTypePosition(node) &&
+        !isLocallyDeclared(node) &&
+        !isGuardedByTypeof(node, node.text)
+      ) {
+        record(node.text, node);
+      }
+    } else if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'globalThis' &&
+      BROWSER_ONLY_GLOBALS.has(node.name.text) &&
+      !isLocallyDeclared(node.expression) &&
+      !isInTypePosition(node) &&
+      !isGuardedByTypeof(node, node.name.text)
+    ) {
+      record(node.name.text, node);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sf);
+  return found;
+}
+
+function isFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function resolveLocalModule(fromDir: string, spec: string): string | null {
+  const base = path.resolve(fromDir, spec);
+  const candidates: string[] = [];
+  const jsMap: Record<string, string[]> = {
+    '.js': ['.ts', '.tsx'],
+    '.mjs': ['.mts'],
+    '.jsx': ['.tsx'],
+  };
+  const ext = path.extname(base);
+  if (['.ts', '.tsx', '.mts'].includes(ext)) candidates.push(base);
+  if (jsMap[ext]) for (const e of jsMap[ext]) candidates.push(base.slice(0, -ext.length) + e);
+  for (const e of ['.ts', '.tsx', '.mts']) candidates.push(base + e);
+  for (const e of ['.ts', '.tsx', '.mts']) candidates.push(path.join(base, `index${e}`));
+  return candidates.find(isFile) ?? null;
+}
+
+function localImportSpecs(sf: ts.SourceFile): { spec: string; node: ts.Node }[] {
+  const specs: { spec: string; node: ts.Node }[] = [];
+  for (const stmt of sf.statements) {
+    if (ts.isImportDeclaration(stmt) && !stmt.importClause?.isTypeOnly && ts.isStringLiteral(stmt.moduleSpecifier)) {
+      specs.push({ spec: stmt.moduleSpecifier.text, node: stmt });
+    } else if (
+      ts.isExportDeclaration(stmt) &&
+      !stmt.isTypeOnly &&
+      stmt.moduleSpecifier &&
+      ts.isStringLiteral(stmt.moduleSpecifier)
+    ) {
+      specs.push({ spec: stmt.moduleSpecifier.text, node: stmt });
+    }
+  }
+  return specs.filter((s) => s.spec.startsWith('.'));
 }
 
 function detectSsrImportedBrowserGlobals(
@@ -108,54 +355,54 @@ function detectSsrImportedBrowserGlobals(
     ts.ScriptKind.TS
   );
 
-  for (const stmt of sf.statements) {
-    if (!ts.isImportDeclaration(stmt) || stmt.importClause?.isTypeOnly) {
-      continue;
-    }
-    if (!ts.isStringLiteral(stmt.moduleSpecifier)) {
-      continue;
-    }
-    const spec = stmt.moduleSpecifier.text;
-    if (!spec.startsWith('.')) {
-      continue;
-    }
+  const direct = findBrowserGlobalRefs(sf);
+  if (direct.size > 0) {
+    const first = Math.min(...direct.values());
+    findings.push({
+      file: astroFile,
+      line: first + 1,
+      category: 'SSR Frontmatter Runtime Impurity',
+      summary: `SSR frontmatter directly references browser-only DOM APIs (${Array.from(direct.keys()).join(', ')}).`,
+      advice: BROWSER_GLOBAL_ADVICE,
+    });
+  }
 
-    const candidatePath = path.resolve(astroDir, spec.endsWith('.ts') ? spec : `${spec}.ts`);
-    if (!fs.existsSync(candidatePath)) {
-      continue;
-    }
+  for (const { spec, node } of localImportSpecs(sf)) {
+    if (!ts.isImportDeclaration(node)) continue;
+    const start = resolveLocalModule(astroDir, spec);
+    if (!start) continue;
 
-    const relTarget = path.relative(ROOT, candidatePath);
-    const targetCode = fs.readFileSync(candidatePath, 'utf8');
-    const targetSf = ts.createSourceFile(
-      relTarget,
-      targetCode,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TS
-    );
-
-    const foundGlobals = new Set<string>();
-    function visit(node: ts.Node) {
-      if (ts.isIdentifier(node) && BROWSER_ONLY_GLOBALS.has(node.text)) {
-        if (ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) {
-          return;
-        }
-        foundGlobals.add(node.text);
+    const visited = new Set<string>();
+    const offenders = new Map<string, Set<string>>();
+    const queue = [start];
+    while (queue.length > 0) {
+      const file = queue.shift() as string;
+      if (visited.has(file)) continue;
+      visited.add(file);
+      const tsf = ts.createSourceFile(
+        file,
+        fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n'),
+        ts.ScriptTarget.Latest,
+        true,
+        scriptKindFor(file)
+      );
+      const refs = findBrowserGlobalRefs(tsf);
+      if (refs.size > 0) offenders.set(toPosix(path.relative(ROOT, file)), new Set(refs.keys()));
+      for (const dep of localImportSpecs(tsf)) {
+        const resolved = resolveLocalModule(path.dirname(file), dep.spec);
+        if (resolved && !visited.has(resolved)) queue.push(resolved);
       }
-      ts.forEachChild(node, visit);
     }
-    visit(targetSf);
 
-    if (foundGlobals.size > 0) {
-      const importLine = sf.getLineAndCharacterOfPosition(stmt.getStart(sf)).line + 2;
+    if (offenders.size > 0) {
+      const importLine = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 2;
+      const detail = Array.from(offenders, ([f, g]) => `${f} (${Array.from(g).join(', ')})`).join('; ');
       findings.push({
         file: astroFile,
         line: importLine,
         category: 'SSR Frontmatter Runtime Impurity',
-        summary: `SSR frontmatter imports "${relTarget}", which references browser-only DOM APIs (${Array.from(foundGlobals).join(', ')}).`,
-        advice:
-          'Keep modules imported in Astro SSR frontmatter (`---`) 100% isomorphic (Edge/Worker safe). Separate pure projection/math helpers from browser DOM controllers (`document`, `navigator`, `HTMLElement`), which should only be imported inside `<script>`.',
+        summary: `SSR frontmatter import "${spec}" reaches modules that reference browser-only DOM APIs: ${detail}.`,
+        advice: BROWSER_GLOBAL_ADVICE,
       });
     }
   }
@@ -390,7 +637,7 @@ function analyzeCodeSnippet(
     code,
     ts.ScriptTarget.Latest,
     true,
-    mode === 'public-js' ? ts.ScriptKind.JS : ts.ScriptKind.TS
+    mode === 'public-js' ? ts.ScriptKind.JS : scriptKindFor(relFile)
   );
 
   const units: UnitMetrics[] = [];
@@ -423,44 +670,52 @@ function analyzeCodeSnippet(
     );
   }
 
-  if (mode !== 'astro-frontmatter') {
-    function findFunctions(node: ts.Node) {
-      if (ts.isFunctionDeclaration(node) && node.name) {
-        units.push(
-          analyzeAstUnit(
-            node,
-            sourceFile,
-            relFile,
-            `${node.name.text}()`,
-            'function',
-            lineOffset,
-            false
-          )
-        );
-      } else if (
-        ts.isVariableDeclaration(node) &&
-        ts.isIdentifier(node.name) &&
-        node.initializer &&
-        (ts.isArrowFunction(node.initializer) ||
-          ts.isFunctionExpression(node.initializer))
-      ) {
-        units.push(
-          analyzeAstUnit(
-            node.initializer,
-            sourceFile,
-            relFile,
-            `${node.name.text}()`,
-            'function',
-            lineOffset,
-            false
-          )
-        );
-      }
-      ts.forEachChild(node, findFunctions);
-    }
+  const addUnit = (node: ts.Node, unitName: string) => {
+    units.push(
+      analyzeAstUnit(node, sourceFile, relFile, unitName, 'function', lineOffset, false)
+    );
+  };
 
-    findFunctions(sourceFile);
+  const isFunctionValue = (n: ts.Node | undefined): n is ts.ArrowFunction | ts.FunctionExpression =>
+    !!n && (ts.isArrowFunction(n) || ts.isFunctionExpression(n));
+
+  const ownerName = (node: ts.Node): string => {
+    for (let p = node.parent; p; p = p.parent) {
+      if (ts.isClassLike(p)) return p.name?.text ?? '<anonymous class>';
+      if (ts.isObjectLiteralExpression(p)) {
+        const holder = p.parent;
+        if (ts.isVariableDeclaration(holder) && ts.isIdentifier(holder.name)) return holder.name.text;
+        return '<object>';
+      }
+    }
+    return '<anonymous>';
+  };
+
+  function findFunctions(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node)) {
+      if (node.name) addUnit(node, `${node.name.text}()`);
+      else if (node.body) addUnit(node, 'default export function()');
+    } else if (ts.isConstructorDeclaration(node) && node.body) {
+      addUnit(node, `${ownerName(node)}.constructor()`);
+    } else if (
+      (ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) &&
+      node.body
+    ) {
+      const prefix = ts.isGetAccessorDeclaration(node) ? 'get ' : ts.isSetAccessorDeclaration(node) ? 'set ' : '';
+      addUnit(node, `${ownerName(node)}.${prefix}${node.name.getText(sourceFile)}()`);
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && isFunctionValue(node.initializer)) {
+      addUnit(node.initializer, `${node.name.text}()`);
+    } else if (ts.isPropertyAssignment(node) && isFunctionValue(node.initializer)) {
+      addUnit(node.initializer, `${ownerName(node)}.${node.name.getText(sourceFile)}()`);
+    } else if (ts.isPropertyDeclaration(node) && isFunctionValue(node.initializer)) {
+      addUnit(node.initializer, `${ownerName(node)}.${node.name.getText(sourceFile)}()`);
+    } else if (ts.isExportAssignment(node) && isFunctionValue(node.expression)) {
+      addUnit(node.expression, 'default export()');
+    }
+    ts.forEachChild(node, findFunctions);
   }
+
+  findFunctions(sourceFile);
 
   return { units, castSmells, fingerprints };
 }
@@ -523,8 +778,8 @@ function collectFiles(dir: string): string[] {
     const rel = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       results.push(...collectFiles(rel));
-    } else if (/\.(ts|astro|js)$/.test(entry.name)) {
-      results.push(rel);
+    } else if (/\.(ts|tsx|mts|astro|js)$/.test(entry.name)) {
+      results.push(toPosix(rel));
     }
   }
   return results;
@@ -545,8 +800,8 @@ const scanDirs = Array.from(
 
 for (const dir of scanDirs) {
   for (const relFile of collectFiles(dir)) {
-    const raw = fs.readFileSync(path.join(ROOT, relFile), 'utf8');
-    if (relFile.endsWith('.ts')) {
+    const raw = fs.readFileSync(path.join(ROOT, relFile), 'utf8').replace(/\r\n/g, '\n');
+    if (/\.(ts|tsx|mts)$/.test(relFile)) {
       const { units, castSmells, fingerprints } = analyzeCodeSnippet(raw, relFile, 'ts', 0);
       smellAdvisories.push(...castSmells);
       allFingerprints.push(...fingerprints);
@@ -579,12 +834,13 @@ for (const dir of scanDirs) {
       const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
       if (fmMatch) {
         smellAdvisories.push(...detectSsrImportedBrowserGlobals(relFile, fmMatch[1]));
-        const { castSmells, fingerprints } = analyzeCodeSnippet(
+        const { units, castSmells, fingerprints } = analyzeCodeSnippet(
           fmMatch[1],
           relFile,
           'astro-frontmatter',
           1
         );
+        allUnits.push(...units);
         smellAdvisories.push(...castSmells);
         allFingerprints.push(...fingerprints);
       }
@@ -624,6 +880,7 @@ for (const [, group] of fingerprintGroups) {
     smellAdvisories.push({
       file: group[0].file,
       line: group[0].line,
+      files: Array.from(distinctFiles),
       category: 'Cross-File Logic Duplication',
       summary: `Identical statement block duplicated across ${locations}: \`${group[0].preview}\``,
       advice:
@@ -663,15 +920,19 @@ for (const u of allUnits) {
 }
 
 if (changedSet !== null) {
-  smellAdvisories = smellAdvisories.filter((a) => changedSet.has(a.file));
+  smellAdvisories = smellAdvisories.filter((a) => (a.files ?? [a.file]).some((f) => changedSet.has(f)));
 }
+
+const reportedUnits = changedSet === null ? allUnits : allUnits.filter((u) => changedSet.has(u.file));
+const reportedDeclarative =
+  changedSet === null ? declarativeFiles : declarativeFiles.filter((f) => changedSet.has(f));
 
 console.log('\n📊 AST Complexity & Architectural Smell Scorecard (Declarative Data & CSS Ignored):');
 console.log(
-  `   • Pure Declarative Modules (CC=1, CogC=0): ${declarativeFiles.join(', ') || 'none'}`
+  `   • Pure Declarative Modules (CC=1, CogC=0): ${reportedDeclarative.join(', ') || 'none'}`
 );
 
-const sortedUnits = [...allUnits].sort(
+const sortedUnits = [...reportedUnits].sort(
   (a, b) => b.cognitive - a.cognitive || b.cyclomatic - a.cyclomatic
 );
 
@@ -702,4 +963,11 @@ if (smellAdvisories.length > 0) {
   console.log('');
 } else {
   console.log('\n✅ Complexity & Smell Advisor: All executable units and Astro scripts are clean.\n');
+}
+
+if (guardrailsConfig.failOnComplexityAdvisories && smellAdvisories.length > 0) {
+  console.error(
+    `❌ failOnComplexityAdvisories is enabled and ${smellAdvisories.length} advisory finding(s) remain: failing.`
+  );
+  process.exit(1);
 }

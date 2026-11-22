@@ -32,7 +32,7 @@ export interface GuardrailsConfig {
 
   /**
    * RegExp patterns that trigger `npm run check:visual` (Playwright)
-   * when modified in `git status --porcelain`.
+   * when changed in the working tree (`git status`) or, with `--base <ref>`, in `<ref>...HEAD`.
    */
   uiTriggerPatterns: RegExp[];
 
@@ -89,9 +89,16 @@ export interface GuardrailsConfig {
 
   /**
    * Brownfield / Enterprise Ratchet Mode:
-   * When true, `check:complexity` only reports advisories on files modified in `git status`.
+   * When true, `check:complexity` only reports advisories on changed files (`git status`, plus `--base <ref>` for CI).
+   * If git is unavailable it warns and analyses all files.
    */
   ratchetChangedFilesOnly: boolean;
+
+  /**
+   * When true, `check:complexity` exits 1 if any advisory is reported (after ratchet filtering).
+   * Defaults to false: advisories are informational.
+   */
+  failOnComplexityAdvisories?: boolean;
 
   /**
    * AST Complexity & Smell Advisory Thresholds.
@@ -108,7 +115,8 @@ export const guardrailsConfig: GuardrailsConfig = {
   scopedModules: ['src/domain', 'src/worker', 'src/ui'],
   extraComplexityScanDirs: ['src/pages', 'public'],
   uiTriggerPatterns: [/^src\/ui\//, /^src\/storyblok\//, /^src\/pages\/index\.astro$/, /^tests\//],
-  visualSpecPath: 'tests/visual-ui.spec.ts',
+  // Set to your Playwright spec (and install @playwright/test) to enable interactive-selector coverage and `check:visual`.
+  visualSpecPath: null,
   globalLayoutAstroPath: 'src/pages/index.astro',
   forbiddenGlobalClassPrefixes: [],
   dependencies: {
@@ -126,6 +134,7 @@ export const guardrailsConfig: GuardrailsConfig = {
     ],
   },
   ratchetChangedFilesOnly: false,
+  failOnComplexityAdvisories: false,
   thresholds: {
     functionCognitive: 15,
     functionCyclomatic: 12,

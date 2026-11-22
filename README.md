@@ -23,11 +23,15 @@ Designed for modern TypeScript, Astro, Storyblok CMS, and Edge/Cloudflare Worker
 ## Requirements
 
 - Node.js **>= 22.6** (scripts run via `node --experimental-strip-types`; the flag is a no-op on Node >= 23.6).
-- npm (`check:deps` uses `npm audit` / `npm outdated`).
+- npm (`check:deps` uses `npm audit` / `npm outdated`; pnpm/yarn are not supported).
+- Add `"type": "module"` to the target `package.json` to avoid Node's module-reparse warning on `scripts/*.ts`.
+- In an npm workspaces monorepo, bootstrap and run guardrails **per package directory** (`--target packages/web`; run `npm run guardrails` there). Changed-file detection is relative to that directory and also sees the root lockfile (`../package-lock.json`).
+- In CI the working tree is clean, so pass the base ref: `npm run guardrails -- --base origin/main` (or `--all`). Without git information every gate runs.
+- `check:deps --audit` fails closed: if `npm audit`/`npm outdated` cannot run (offline, no lockfile) the check exits 1.
 
 ---
 
-## 1. Install Globally on Your Machine (Claude Code & Antigravity)
+## 1. Install Globally on Your Machine (Claude Code, Antigravity & Copilot CLI)
 
 Clone this repository and run the global symlink installer:
 
@@ -38,7 +42,7 @@ chmod +x install-global-skill.sh
 ./install-global-skill.sh
 ```
 
-This links the skill into both:
+This links the skill into:
 - `~/.claude/skills/agentic-guardrails` (**Claude Code**)
 - `~/.gemini/config/skills/agentic-guardrails` (**Antigravity**)
 - `~/.copilot/skills/agentic-guardrails` (**GitHub Copilot CLI**)
@@ -60,12 +64,14 @@ node /path/to/agentic-guardrails/scripts/bootstrap-repo.mjs --target /path/to/yo
 
 This installs:
 - `guardrails.config.ts` — The single project configuration file (scoped module paths, UI trigger regexes, optional Storyblok rules, brownfield `ratchetChangedFilesOnly` mode, and complexity thresholds).
+- `scripts/git-changes.ts` — Shared changed-file detection (NUL-safe, untracked dirs expanded, `--base` support).
 - `scripts/run-guardrails.ts` — Diff-aware runner (runs static + AST complexity checks in `<300ms`; triggers Playwright `check:visual` automatically only when UI files are modified in `git status`).
 - `scripts/check-doc-drift.ts` — Doc-drift, ADR path integrity, `.astro` import boundary, style encapsulation, and interactive selector checker.
 - `scripts/check-complexity.ts` — TypeScript & Astro AST Complexity and Architectural Smell Advisor.
 - `scripts/check-deps.ts` — Two-tier dependency hygiene, CVE audit and freshness checker.
 - `.dependency-cruiser.cjs` — Module boundary rules.
-- `package.json` scripts (`check:*`, `guardrails`) — added if missing; existing scripts are never overwritten. You still need `depcruise`, `typescript` and `playwright` devDependencies (the bootstrapper prints the exact install command).
+- `package.json` scripts (`check:*`, `guardrails`) — added if missing; existing scripts are never overwritten (a differing one triggers a warning); a minimal `package.json` is created if none exists; `check:types` is added only for Astro projects. You still need `dependency-cruiser` and `typescript` devDependencies (the bootstrapper prints the install command), plus `@playwright/test` if you enable `visualSpecPath` (disabled by default).
+- `tsconfig.json` — only its `exclude` list is extended (skipped with a warning for JSONC or `extends`-only configs).
 - `AGENTS.md` & `CLAUDE.md` (`@AGENTS.md`) — Progressive context router shared across GitHub Copilot, Claude Code, and Antigravity.
 
 ---
@@ -85,3 +91,14 @@ export const guardrailsConfig: GuardrailsConfig = {
   // ...
 };
 ```
+
+---
+
+## 4. Development
+
+```bash
+npm install
+npm test   # node:test fixture projects for the bootstrapper and every checker
+```
+
+`failOnComplexityAdvisories: true` in `guardrails.config.ts` turns `check:complexity` advisories into a failing gate (default: informational).

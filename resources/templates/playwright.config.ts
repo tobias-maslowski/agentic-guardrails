@@ -2,6 +2,8 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = Number(process.env.PLAYWRIGHT_PORT ?? 4321);
 const BASE_URL = `http://localhost:${PORT}`;
+// TODO: replace '/' with a project-specific readiness route
+const READY_PATH = process.env.PLAYWRIGHT_READY_PATH ?? '/';
 
 export default defineConfig({
   testDir: './tests',
@@ -20,10 +22,13 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npx astro dev --port ${PORT}`,
-    // Point to a project-specific route or port so reuseExistingServer never attaches to another repo's server
-    url: BASE_URL,
-    reuseExistingServer: !process.env.CI,
+    // --strictPort: fail instead of silently hopping to another port
+    command: `npx astro dev --port ${PORT} --strictPort`,
+    // Readiness URL: set READY_PATH to a route that only THIS project serves (e.g. a unique page
+    // or health route), so a dev server from another repo on the same port is never mistaken for ours.
+    url: `${BASE_URL}${READY_PATH}`,
+    // Never attach to an already-running server unless explicitly opted in (local iteration only).
+    reuseExistingServer: process.env.PLAYWRIGHT_REUSE_SERVER === '1' && !process.env.CI,
     timeout: 30_000,
   },
 });

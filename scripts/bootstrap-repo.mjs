@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
 
 /**
  * 1-Command Repository Guardrails Bootstrapper (scripts/bootstrap-repo.mjs)
@@ -14,27 +15,55 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(__dirname, '..');
 const RESOURCES = path.join(SKILL_ROOT, 'resources');
 
-const args = process.argv.slice(2);
-const targetIdx = args.indexOf('--target');
-const targetDir = path.resolve(
-  targetIdx !== -1 && args[targetIdx + 1] ? args[targetIdx + 1] : process.cwd()
-);
+let cli;
+try {
+  cli = parseArgs({
+    options: {
+      target: { type: 'string' },
+      preset: { type: 'string', default: 'standard' },
+      force: { type: 'boolean', default: false },
+    },
+    strict: true,
+  }).values;
+} catch (err) {
+  console.error(`❌ ${err.message}\nUsage: node bootstrap-repo.mjs [--target <dir>] [--preset standard|storyblok] [--force]`);
+  process.exit(1);
+}
 
-const presetIdx = args.indexOf('--preset');
-const preset =
-  presetIdx !== -1 && args[presetIdx + 1] ? args[presetIdx + 1].toLowerCase() : 'standard';
+const targetDir = path.resolve(cli.target ?? process.cwd());
+const preset = cli.preset.toLowerCase();
+if (!['standard', 'storyblok'].includes(preset)) {
+  console.error(`❌ Unknown preset "${cli.preset}". Use "standard" or "storyblok".`);
+  process.exit(1);
+}
 const isStoryblok = preset === 'storyblok';
-const force = args.includes('--force');
+const force = cli.force;
+
+// Validate existing manifests BEFORE writing anything, so a bad input never leaves a partial install.
+const pkgPath = path.join(targetDir, 'package.json');
+let pkg = null;
+if (fs.existsSync(pkgPath)) {
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  } catch (err) {
+    console.error(`❌ ${pkgPath} is not valid JSON (${err.message}). Fix it and re-run; nothing was written.`);
+    process.exit(1);
+  }
+  if (pkg.scripts !== undefined && (typeof pkg.scripts !== 'object' || pkg.scripts === null || Array.isArray(pkg.scripts))) {
+    console.error(`❌ "scripts" in ${pkgPath} must be an object. Nothing was written.`);
+    process.exit(1);
+  }
+}
 
 // Auto-create target directory if it does not exist yet
 fs.mkdirSync(targetDir, { recursive: true });
 
-function copyIfMissingOrForce(srcRel, destRel, allowOverwrite = false) {
+function copyIfMissingOrForce(srcRel, destRel, allowOverwrite = false, userOwned = false) {
   const srcPath = path.join(RESOURCES, srcRel);
   const destPath = path.join(targetDir, destRel);
   fs.mkdirSync(path.dirname(destPath), { recursive: true });
   if (fs.existsSync(destPath) && !allowOverwrite) {
-    console.log(`⏭️  Skipped existing ${destRel} (pass --force to overwrite)`);
+    console.log(`⏭️  Skipped existing ${destRel}${userOwned ? ' (user-owned, never overwritten)' : ' (pass --force to overwrite)'}`);
     return false;
   }
   fs.copyFileSync(srcPath, destPath);
@@ -55,15 +84,18 @@ function writeIfMissingOrForce(destRel, content, allowOverwrite = false) {
 }
 
 // 1. Install core guardrail scripts and dependency-cruiser rules
-copyIfMissingOrForce('guardrails.config.ts', 'guardrails.config.ts', force);
+const installedConfig = copyIfMissingOrForce('guardrails.config.ts', 'guardrails.config.ts', force);
 copyIfMissingOrForce('run-guardrails.ts', 'scripts/run-guardrails.ts', force);
+copyIfMissingOrForce('git-changes.ts', 'scripts/git-changes.ts', force);
 copyIfMissingOrForce('check-doc-drift.ts', 'scripts/check-doc-drift.ts', force);
 copyIfMissingOrForce('check-complexity.ts', 'scripts/check-complexity.ts', force);
 copyIfMissingOrForce('check-deps.ts', 'scripts/check-deps.ts', force);
 copyIfMissingOrForce('dependency-cruiser.cjs', '.dependency-cruiser.cjs', force);
 
 // If --preset storyblok, patch guardrails.config.ts with the 5 Storyblok scoped modules and storyblok block
-if (isStoryblok) {
+if (isStoryblok && !installedConfig) {
+  console.warn("⚠️  Existing guardrails.config.ts kept: add the Storyblok scopedModules and `storyblok` block manually (see README), or re-run with --force.");
+} else if (isStoryblok) {
   const cfgPath = path.join(targetDir, 'guardrails.config.ts');
   const cfg = fs.readFileSync(cfgPath, 'utf8');
   const patched = cfg.replace(
@@ -82,7 +114,7 @@ if (isStoryblok) {
 const rootTemplate = isStoryblok
   ? 'templates/AGENTS.storyblok.md'
   : 'templates/AGENTS.root.md';
-copyIfMissingOrForce(rootTemplate, 'AGENTS.md', false);
+copyIfMissingOrForce(rootTemplate, 'AGENTS.md', false, true);
 writeIfMissingOrForce('CLAUDE.md', '@AGENTS.md\n', false);
 writeIfMissingOrForce(
   '.github/copilot-instructions.md',
@@ -159,30 +191,32 @@ for (const mod of activeModules) {
 }
 fs.mkdirSync(path.join(targetDir, 'src/pages'), { recursive: true });
 
-// 5. If tsconfig.json exists, ensure Node CLI scripts are excluded from Worker runtime typecheck
+// 5. If tsconfig.json exists, exclude Node CLI scripts from the (Worker) runtime typecheck.
+// Only the exclude list is touched; `include`, `extends` and everything else stay as they are.
 const tsconfigPath = path.join(targetDir, 'tsconfig.json');
 if (fs.existsSync(tsconfigPath)) {
+  const manual = 'add "scripts", "guardrails.config.ts", "playwright.config.ts" and "tests" to its "exclude" manually.';
+  let parsed = null;
   try {
-    const rawTsconfig = fs.readFileSync(tsconfigPath, 'utf8');
-    const parsed = JSON.parse(rawTsconfig);
-    const excludeSet = new Set(Array.isArray(parsed.exclude) ? parsed.exclude : ['dist', 'node_modules']);
-    excludeSet.add('scripts');
-    excludeSet.add('guardrails.config.ts');
-    excludeSet.add('playwright.config.ts');
-    excludeSet.add('tests');
-    parsed.exclude = Array.from(excludeSet);
-    if (Array.isArray(parsed.include)) {
-      parsed.include = parsed.include.filter((inc) => !inc.startsWith('scripts'));
-    }
-    fs.writeFileSync(tsconfigPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
-    console.log('✅ Updated tsconfig.json exclude list to isolate Node CLI scripts from Worker runtime types');
+    parsed = JSON.parse(fs.readFileSync(tsconfigPath, 'utf8'));
   } catch {
-    // Ignore non-standard JSON comments in tsconfig.json
+    console.warn(`⚠️  tsconfig.json contains comments/trailing commas and was not modified; ${manual}`);
+  }
+  if (parsed && !Array.isArray(parsed.exclude) && parsed.extends) {
+    console.warn(`⚠️  tsconfig.json extends another config and has no own "exclude"; not modified (it would replace the inherited list); ${manual}`);
+  } else if (parsed) {
+    const exclude = new Set(Array.isArray(parsed.exclude) ? parsed.exclude : ['dist', 'node_modules']);
+    const before = exclude.size;
+    for (const entry of ['scripts', 'guardrails.config.ts', 'playwright.config.ts', 'tests']) exclude.add(entry);
+    if (exclude.size !== before) {
+      parsed.exclude = Array.from(exclude);
+      fs.writeFileSync(tsconfigPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
+      console.log('✅ Updated tsconfig.json exclude list to isolate Node CLI scripts from Worker runtime types');
+    }
   }
 }
 
 // 6. Add guardrail scripts to package.json (never overwrite existing ones)
-const pkgPath = path.join(targetDir, 'package.json');
 const GUARDRAIL_SCRIPTS = {
   'check:arch': 'depcruise src --config .dependency-cruiser.cjs',
   'check:drift': 'node --experimental-strip-types scripts/check-doc-drift.ts',
@@ -191,21 +225,31 @@ const GUARDRAIL_SCRIPTS = {
   'check:visual': 'playwright test',
   guardrails: 'node --experimental-strip-types scripts/run-guardrails.ts',
 };
-if (fs.existsSync(pkgPath)) {
-  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-  pkg.scripts = pkg.scripts ?? {};
-  const added = [];
-  for (const [name, cmd] of Object.entries(GUARDRAIL_SCRIPTS)) {
-    if (!(name in pkg.scripts)) {
-      pkg.scripts[name] = cmd;
-      added.push(name);
-    }
+const allDeclared = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
+if ('astro' in allDeclared) GUARDRAIL_SCRIPTS['check:types'] = 'astro check && tsc --noEmit';
+
+const manifest = pkg ?? { name: path.basename(targetDir), private: true, type: 'module' };
+manifest.scripts = manifest.scripts ?? {};
+const added = [];
+for (const [name, cmd] of Object.entries(GUARDRAIL_SCRIPTS)) {
+  if (!(name in manifest.scripts)) {
+    manifest.scripts[name] = cmd;
+    added.push(name);
+  } else if (manifest.scripts[name] !== cmd) {
+    console.warn(`⚠️  package.json script "${name}" already exists and differs from the guardrail default; kept yours. Expected: ${cmd}`);
   }
-  fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
-  console.log(added.length ? `✅ Added package.json scripts: ${added.join(', ')}` : '⏭️  package.json scripts already present');
-} else {
-  console.log('ℹ️  No package.json found; add the guardrail scripts from SKILL.md manually.');
 }
-console.log('\nNext: npm install -D dependency-cruiser typescript @playwright/test');
+if (added.length > 0 || !pkg) {
+  fs.writeFileSync(pkgPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+}
+console.log(
+  pkg
+    ? added.length ? `✅ Added package.json scripts: ${added.join(', ')}` : '⏭️  package.json scripts already present'
+    : `✅ Created package.json with guardrail scripts: ${added.join(', ')}`
+);
+if (pkg && pkg.type !== 'module') {
+  console.warn('ℹ️  package.json has no "type": "module"; Node prints a reparse warning for scripts/*.ts. Add it if your project allows.');
+}
+console.log('\nNext: npm install -D dependency-cruiser typescript   (add @playwright/test if you enable visualSpecPath)');
 
 console.log(`\n🎯 Guardrails bootstrapped (${preset} preset) in ${targetDir}`);

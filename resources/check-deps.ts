@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { guardrailsConfig } from '../guardrails.config.ts';
@@ -15,6 +15,9 @@ import { guardrailsConfig } from '../guardrails.config.ts';
  * 2. Registry Security Audit & Training-Cutoff Freshness (`--audit` / `--all`):
  *    - Runs `npm audit --json` and fails deterministically (`exit 1`) on unacknowledged CVEs >= `failOnVulnerabilitySeverity`.
  *    - Runs `npm outdated --json` and fails deterministically (`exit 1`) on outdated direct packages when `failOnOutdated: true`.
+ *    - Fails closed: if a requested audit cannot run (no lockfile, offline, error JSON, malformed output, spawn failure)
+ *      the script exits 1 with "audit unavailable: <reason>". It never reports "clean" for an audit that did not run.
+ *    - Works from an npm workspace package directory: npm resolves the root lockfile itself.
  */
 
 const ROOT = process.cwd();
@@ -25,16 +28,32 @@ if (!fs.existsSync(pkgPath)) {
   process.exit(0);
 }
 
-interface PackageJson {
-  dependencies?: Record<string, string>;
-  devDependencies?: Record<string, string>;
+const DEP_SECTIONS = [
+  'dependencies',
+  'devDependencies',
+  'optionalDependencies',
+  'peerDependencies',
+] as const;
+
+type PackageJson = Partial<Record<(typeof DEP_SECTIONS)[number], Record<string, string>>>;
+
+let pkg: PackageJson;
+try {
+  pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as PackageJson;
+  if (pkg === null || typeof pkg !== 'object' || Array.isArray(pkg)) {
+    throw new Error('top-level value is not an object');
+  }
+} catch (err: unknown) {
+  console.error(
+    `❌ Cannot read package.json: ${err instanceof Error ? err.message : String(err)}`
+  );
+  process.exit(1);
 }
 
-const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as PackageJson;
-const allDeps: Record<string, string> = {
-  ...(pkg.dependencies ?? {}),
-  ...(pkg.devDependencies ?? {}),
-};
+const directNames = new Set<string>();
+for (const section of DEP_SECTIONS) {
+  for (const name of Object.keys(pkg[section] ?? {})) directNames.add(name);
+}
 
 const hardErrors: string[] = [];
 const advisories: string[] = [];
@@ -48,7 +67,10 @@ const depConfig = guardrailsConfig.dependencies ?? {
 };
 
 const acknowledgedOutdated = new Map<string, string>();
+// Keyed by `${package}|${GHSA-ID upper-cased}`
 const acknowledgedCveIds = new Map<string, string>();
+const ackKey = (pkgName: string, ghsa: string) => `${pkgName}|${ghsa.toUpperCase()}`;
+const GHSA_RE = /GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i;
 
 for (const entry of depConfig.acknowledgedAdvisories ?? []) {
   if (!entry.reason || entry.reason.trim().length < 12) {
@@ -64,7 +86,10 @@ for (const entry of depConfig.acknowledgedAdvisories ?? []) {
       );
       continue;
     }
-    acknowledgedCveIds.set(entry.ghsaId, `${entry.package}: ${entry.reason.trim()}`);
+    acknowledgedCveIds.set(
+      ackKey(entry.package, entry.ghsaId),
+      `${entry.package}: ${entry.reason.trim()}`
+    );
   } else if (entry.kind === 'outdated') {
     acknowledgedOutdated.set(entry.package, entry.reason.trim());
   } else {
@@ -75,46 +100,61 @@ for (const entry of depConfig.acknowledgedAdvisories ?? []) {
 }
 
 // --- TIER 1: Fast Local Package Hygiene ---
-for (const banned of depConfig.bannedPackages) {
-  if (allDeps[banned.name]) {
-    hardErrors.push(
-      `[Banned Legacy Dependency] "${banned.name}" (${allDeps[banned.name]}) is installed. Use ${banned.replacement} instead.`
-    );
-  }
+/** Splits an `npm:target@range` alias spec; non-alias specs resolve to the declared name. */
+function resolveAlias(name: string, spec: string): { target: string; range: string } {
+  const trimmed = spec.trim();
+  if (!trimmed.startsWith('npm:')) return { target: name, range: trimmed };
+  const body = trimmed.slice(4);
+  const at = body.lastIndexOf('@');
+  return at > 0
+    ? { target: body.slice(0, at), range: body.slice(at + 1) }
+    : { target: body, range: '' };
 }
 
-for (const [name, versionRange] of Object.entries(allDeps)) {
-  const trimmed = versionRange.trim().toLowerCase();
-  if (trimmed === '*' || trimmed === 'latest') {
-    hardErrors.push(
-      `[Unpinned Dependency Version] "${name}": "${versionRange}" uses a wildcard. Pin a semver range (e.g. "^1.0.0").`
-    );
+// Each section is evaluated on its own so a devDependency cannot mask a runtime declaration.
+for (const section of DEP_SECTIONS) {
+  for (const [name, rawSpec] of Object.entries(pkg[section] ?? {})) {
+    const spec = String(rawSpec);
+    const { target, range } = resolveAlias(name, spec);
+    const banned = depConfig.bannedPackages.find((b) => b.name === name || b.name === target);
+    if (banned) {
+      const alias = target !== name ? ` (alias of "${target}")` : '';
+      hardErrors.push(
+        `[Banned Legacy Dependency] "${name}"${alias} (${spec}) is declared in ${section}. Use ${banned.replacement} instead.`
+      );
+    }
+    const wildcard = range.toLowerCase();
+    if (wildcard === '*' || wildcard === 'latest') {
+      hardErrors.push(
+        `[Unpinned Dependency Version] "${name}": "${spec}" in ${section} uses a wildcard. Pin a semver range (e.g. "^1.0.0").`
+      );
+    }
   }
 }
 
 // --- TIER 2: Diff-Aware or Explicit Security & Freshness Audit ---
 const runRegistryAudit = process.argv.includes('--audit') || process.argv.includes('--all');
 
+type Severity = 'info' | 'low' | 'moderate' | 'high' | 'critical';
+
+interface NpmAuditVia {
+  name?: string;
+  title?: string;
+  url?: string;
+  severity?: string;
+}
+
 interface NpmAuditVulnerability {
   name: string;
-  severity: 'info' | 'low' | 'moderate' | 'high' | 'critical';
+  severity: Severity;
   isDirect: boolean;
-  via: Array<string | { title?: string; url?: string; severity?: string }>;
+  via: Array<string | NpmAuditVia>;
   fixAvailable: boolean | { name: string; version: string; isSemVerMajor: boolean };
 }
 
 interface NpmAuditReport {
+  error?: { code?: string; summary?: string; detail?: string };
   vulnerabilities?: Record<string, NpmAuditVulnerability>;
-  metadata?: {
-    vulnerabilities?: {
-      info?: number;
-      low?: number;
-      moderate?: number;
-      high?: number;
-      critical?: number;
-      total?: number;
-    };
-  };
 }
 
 interface NpmOutdatedEntry {
@@ -122,6 +162,14 @@ interface NpmOutdatedEntry {
   wanted?: string;
   latest?: string;
   dependent?: string;
+}
+
+interface Leaf {
+  pkg: string;
+  title: string;
+  url: string;
+  severity: string;
+  ghsa?: string;
 }
 
 const SEVERITY_RANK: Record<string, number> = {
@@ -133,110 +181,217 @@ const SEVERITY_RANK: Record<string, number> = {
   critical: 4,
 };
 
+const NPM_TIMEOUT_MS = 120_000;
+const NPM_MAX_BUFFER = 64 * 1024 * 1024;
+
+type NpmResult = { ok: true; stdout: string; status: number | null } | { ok: false; reason: string };
+
+function runNpm(args: string[]): NpmResult {
+  const r = spawnSync('npm', args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: NPM_TIMEOUT_MS,
+    maxBuffer: NPM_MAX_BUFFER,
+    shell: process.platform === 'win32',
+  });
+  if (r.error) {
+    return { ok: false, reason: `\`npm ${args.join(' ')}\` could not run (${r.error.message})` };
+  }
+  return { ok: true, stdout: r.stdout ?? '', status: r.status };
+}
+
+function describeNpmError(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const e = error as { code?: string; summary?: string };
+    return [e.code, e.summary].filter(Boolean).join(': ') || JSON.stringify(error);
+  }
+  return String(error);
+}
+
+/** Resolves string `via` chains (npm audit v2) to leaf advisories. `seen` guards against cycles. */
+function resolveLeaves(
+  name: string,
+  vulns: Record<string, NpmAuditVulnerability>,
+  seen: Set<string>
+): Leaf[] {
+  const vuln = vulns[name];
+  if (!vuln || seen.has(name)) return [];
+  seen.add(name);
+  const leaves: Leaf[] = [];
+  for (const via of vuln.via ?? []) {
+    if (typeof via === 'string') {
+      if (vulns[via]) {
+        leaves.push(...resolveLeaves(via, vulns, seen));
+      } else {
+        leaves.push({
+          pkg: via,
+          title: `unresolved advisory source "${via}"`,
+          url: '',
+          severity: vuln.severity,
+        });
+      }
+    } else if (via && typeof via === 'object') {
+      leaves.push({
+        pkg: via.name ?? vuln.name ?? name,
+        title: via.title ?? 'untitled advisory',
+        url: via.url ?? '',
+        severity: via.severity ?? vuln.severity,
+        ghsa: via.url?.match(GHSA_RE)?.[0]?.toUpperCase(),
+      });
+    }
+  }
+  return leaves;
+}
+
+let auditRan = false;
+let outdatedRan = false;
+
 if (runRegistryAudit) {
-  // 2A. Security Audit (`npm audit --json`)
-  let auditJsonRaw = '';
-  try {
-    auditJsonRaw = execSync('npm audit --json', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-  } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'stdout' in err && typeof err.stdout === 'string') {
-      auditJsonRaw = err.stdout;
+  // 2A. Security Audit (`npm audit --json`). Exit 1 with a JSON report is normal when vulnerabilities exist.
+  const audit = runNpm(['audit', '--json']);
+  let report: NpmAuditReport | undefined;
+  let auditFailure = '';
+
+  if (!audit.ok) {
+    auditFailure = audit.reason;
+  } else if (!audit.stdout.trim()) {
+    auditFailure = `\`npm audit --json\` produced no output (exit ${audit.status})`;
+  } else {
+    try {
+      report = JSON.parse(audit.stdout) as NpmAuditReport;
+    } catch {
+      auditFailure = `\`npm audit --json\` returned malformed JSON (exit ${audit.status})`;
+    }
+  }
+  if (report) {
+    if (report === null || typeof report !== 'object') {
+      auditFailure = 'npm audit returned an unexpected report';
+    } else if (report.error) {
+      auditFailure = describeNpmError(report.error);
+    } else if (!report.vulnerabilities || typeof report.vulnerabilities !== 'object') {
+      auditFailure = 'npm audit report has no `vulnerabilities` section';
     }
   }
 
-  if (auditJsonRaw) {
+  if (auditFailure || !report?.vulnerabilities) {
+    hardErrors.push(`[Audit Unavailable] audit unavailable: ${auditFailure}`);
+  } else {
+    auditRan = true;
+    const vulns = report.vulnerabilities;
+    const failRank = SEVERITY_RANK[depConfig.failOnVulnerabilitySeverity] ?? 3;
+    const usedAckKeys = new Set<string>();
+    const graphPackages = new Set<string>(Object.keys(vulns));
+
+    for (const vuln of Object.values(vulns)) {
+      let leaves = resolveLeaves(vuln.name, vulns, new Set());
+      if (leaves.length === 0) {
+        leaves = [
+          { pkg: vuln.name, title: 'no advisory details reported', url: '', severity: vuln.severity },
+        ];
+      }
+
+      const remaining: Leaf[] = [];
+      for (const leaf of leaves) {
+        graphPackages.add(leaf.pkg);
+        const key = leaf.ghsa ? ackKey(leaf.pkg, leaf.ghsa) : undefined;
+        if (key && acknowledgedCveIds.has(key)) {
+          usedAckKeys.add(key);
+          acknowledgedNotes.push(`[Acknowledged CVE ${leaf.ghsa}] ${acknowledgedCveIds.get(key)}`);
+        } else {
+          remaining.push(leaf);
+        }
+      }
+      // A transitive entry is acknowledged only when every reachable leaf advisory is.
+      if (remaining.length === 0) continue;
+
+      const rank = Math.max(
+        ...remaining.map((l) => SEVERITY_RANK[l.severity] ?? SEVERITY_RANK[vuln.severity] ?? 0)
+      );
+      if (rank < SEVERITY_RANK.moderate) continue;
+
+      const titles = remaining.map(
+        (l) =>
+          `${l.title}${l.url ? ` (${l.url})` : ''}${l.pkg !== vuln.name ? ` via "${l.pkg}"` : ''}`
+      );
+      const detail =
+        titles.slice(0, 2).join('; ') +
+        (titles.length > 2 ? ` (+${titles.length - 2} more CVEs)` : '');
+
+      const fixNote =
+        typeof vuln.fixAvailable === 'object' && vuln.fixAvailable
+          ? `Fix available via \`npm install ${vuln.fixAvailable.name}@${vuln.fixAvailable.version}\`${vuln.fixAvailable.isSemVerMajor ? ' (major upgrade)' : ''}`
+          : vuln.fixAvailable
+            ? 'Fix available via `npm audit fix`'
+            : 'No automatic upstream fix available yet';
+
+      const severityLabel =
+        Object.keys(SEVERITY_RANK).find((k) => SEVERITY_RANK[k] === rank && k !== 'none') ??
+        vuln.severity;
+      const msg = `[Security CVE: ${severityLabel.toUpperCase()}] Package "${vuln.name}" (${vuln.isDirect ? 'direct' : 'transitive'}) — ${detail}. ${fixNote}.`;
+
+      if (rank >= failRank) {
+        hardErrors.push(msg);
+      } else {
+        advisories.push(msg);
+      }
+    }
+
+    for (const [key, note] of acknowledgedCveIds) {
+      if (usedAckKeys.has(key)) continue;
+      const [ackPkg, ghsa] = key.split('|');
+      advisories.push(
+        graphPackages.has(ackPkg)
+          ? `[Stale CVE Exception] ${ghsa} for "${ackPkg}" matches no current advisory (${note}). Remove it from guardrails.config.ts.`
+          : `[Stale CVE Exception] "${ackPkg}" (${ghsa}) is not in the audit graph (${note}). Remove it from guardrails.config.ts.`
+      );
+    }
+  }
+
+  // 2B. Outdated Direct Dependencies (`npm outdated --json`). Exit 1 with JSON is normal when packages are outdated.
+  const outdatedRes = runNpm(['outdated', '--json']);
+  let outdated: Record<string, NpmOutdatedEntry | NpmOutdatedEntry[]> | undefined;
+  let outdatedFailure = '';
+
+  if (!outdatedRes.ok) {
+    outdatedFailure = outdatedRes.reason;
+  } else if (!outdatedRes.stdout.trim()) {
+    if (outdatedRes.status === 0) {
+      outdated = {};
+    } else {
+      outdatedFailure = `\`npm outdated --json\` produced no output (exit ${outdatedRes.status})`;
+    }
+  } else {
     try {
-      const report = JSON.parse(auditJsonRaw) as NpmAuditReport;
-      const counts = report.metadata?.vulnerabilities ?? {};
-      const total = counts.total ?? 0;
+      const parsed: unknown = JSON.parse(outdatedRes.stdout);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        outdatedFailure = '`npm outdated --json` returned an unexpected report';
+      } else if ('error' in parsed) {
+        outdatedFailure = describeNpmError((parsed as { error: unknown }).error);
+      } else {
+        outdated = parsed as Record<string, NpmOutdatedEntry | NpmOutdatedEntry[]>;
+      }
+    } catch {
+      outdatedFailure = `\`npm outdated --json\` returned malformed JSON (exit ${outdatedRes.status})`;
+    }
+  }
 
-      if (total > 0 && report.vulnerabilities) {
-        const failRank = SEVERITY_RANK[depConfig.failOnVulnerabilitySeverity] ?? 3;
-
-        const notableVulns = Object.values(report.vulnerabilities).filter(
-          (v) => (SEVERITY_RANK[v.severity] ?? 0) >= SEVERITY_RANK.moderate
-        );
-
-        for (const vuln of notableVulns) {
-          const rank = SEVERITY_RANK[vuln.severity] ?? 0;
-          const directAdvisories = vuln.via.filter(
-            (v): v is { title?: string; url?: string; severity?: string } =>
-              typeof v === 'object' && v !== null && Boolean(v.title)
-          );
-
-          // Check if every direct GHSA ID on this package has been explicitly acknowledged
-          const ghsaIds = directAdvisories
-            .map((v) => v.url?.match(/GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i)?.[0])
-            .filter((id): id is string => Boolean(id));
-
-          const unacknowledgedAdvisories = directAdvisories.filter((v) => {
-            const id = v.url?.match(/GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/i)?.[0];
-            return !id || !acknowledgedCveIds.has(id);
-          });
-
-          for (const id of ghsaIds) {
-            if (acknowledgedCveIds.has(id)) {
-              acknowledgedNotes.push(`[Acknowledged CVE ${id}] ${acknowledgedCveIds.get(id)}`);
-            }
-          }
-
-          if (directAdvisories.length > 0 && unacknowledgedAdvisories.length === 0) {
-            continue;
-          }
-
-          const advisoryTitles = unacknowledgedAdvisories.map(
-            (v) => `${v.title} (${v.url ?? ''})`
-          );
-
-          const detail =
-            advisoryTitles.length > 0
-              ? advisoryTitles.slice(0, 2).join('; ') +
-                (advisoryTitles.length > 2 ? ` (+${advisoryTitles.length - 2} more CVEs)` : '')
-              : `Transitive vulnerability via ${vuln.via.map((v) => (typeof v === 'string' ? v : '')).filter(Boolean).join(', ')}`;
-
-          const fixNote =
-            typeof vuln.fixAvailable === 'object'
-              ? `Fix available via \`npm install ${vuln.fixAvailable.name}@${vuln.fixAvailable.version}\`${vuln.fixAvailable.isSemVerMajor ? ' (major upgrade)' : ''}`
-              : vuln.fixAvailable
-                ? 'Fix available via `npm audit fix`'
-                : 'No automatic upstream fix available yet';
-
-          const msg = `[Security CVE: ${vuln.severity.toUpperCase()}] Package "${vuln.name}" (${vuln.isDirect ? 'direct' : 'transitive'}) — ${detail}. ${fixNote}.`;
-
-          if (rank >= failRank) {
+  if (outdatedFailure || !outdated) {
+    hardErrors.push(`[Outdated Check Unavailable] audit unavailable: ${outdatedFailure}`);
+  } else {
+    outdatedRan = true;
+    for (const [name, rawInfo] of Object.entries(outdated)) {
+      for (const info of Array.isArray(rawInfo) ? rawInfo : [rawInfo]) {
+        const ackReason = acknowledgedOutdated.get(name);
+        if (!info.current) {
+          const msg = `[Dependency Not Installed] "${name}" is declared but not installed (wanted ${info.wanted ?? 'unknown'}, latest ${info.latest ?? 'unknown'}). Run \`npm install\` so it can be audited.`;
+          if (ackReason) {
+            acknowledgedNotes.push(`[Acknowledged Version Pin] "${name}" (not installed): ${ackReason}`);
+          } else if (depConfig.failOnOutdated) {
             hardErrors.push(msg);
           } else {
             advisories.push(msg);
           }
-        }
-      }
-    } catch {
-      // Ignore malformed audit JSON if offline
-    }
-  }
-
-  // 2B. Outdated Direct Dependencies (`npm outdated --json`)
-  let outdatedRaw = '';
-  try {
-    outdatedRaw = execSync('npm outdated --json', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-  } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'stdout' in err && typeof err.stdout === 'string') {
-      outdatedRaw = err.stdout;
-    }
-  }
-
-  if (outdatedRaw) {
-    try {
-      const outdated = JSON.parse(outdatedRaw) as Record<string, NpmOutdatedEntry>;
-      for (const [name, info] of Object.entries(outdated)) {
-        if (info.current && info.latest && info.current !== info.latest) {
-          const ackReason = acknowledgedOutdated.get(name);
+        } else if (info.latest && info.current !== info.latest) {
           const msg = `[Outdated Direct Dependency] "${name}" is at ${info.current} (latest stable: ${info.latest}). Run \`npm install ${name}@latest\`.`;
           if (ackReason) {
             acknowledgedNotes.push(
@@ -249,17 +404,26 @@ if (runRegistryAudit) {
           }
         }
       }
-    } catch {
-      // Ignore offline/registry errors
     }
   }
 }
 
-if (acknowledgedNotes.length > 0) {
-  console.log(`\nℹ️  [Acknowledged Dependency Exceptions] (${acknowledgedNotes.length}):`);
-  for (const note of Array.from(new Set(acknowledgedNotes))) {
+const uniqueNotes = Array.from(new Set(acknowledgedNotes));
+if (uniqueNotes.length > 0) {
+  console.log(`\nℹ️  [Acknowledged Dependency Exceptions] (${uniqueNotes.length}):`);
+  for (const note of uniqueNotes) {
     console.log(`  • ${note}`);
   }
+}
+
+if (advisories.length > 0) {
+  console.log(
+    `\n🛡️  [Dependency Advisories: moderate or higher below the failure threshold, and notes] (${advisories.length}):`
+  );
+  for (const adv of advisories) {
+    console.log(`  • ${adv}`);
+  }
+  console.log('');
 }
 
 if (hardErrors.length > 0) {
@@ -273,19 +437,12 @@ if (hardErrors.length > 0) {
     '\n🔧 Mandatory Resolution Protocol (DO NOT SELF-EXEMPT):\n' +
       '  1. You MUST actually attempt to upgrade the outdated/vulnerable packages in `package.json` (`npm install <pkg>@latest`) and verify if `npm run build` and `npm run guardrails` pass.\n' +
       '  2. FORBIDDEN SHORTCUT: Do NOT add entries to `guardrails.config.ts -> dependencies.acknowledgedAdvisories` without testing the upgrade first. Version pins (`kind: "outdated"`) NEVER silence security CVEs (`kind: "cve"`, which require an explicit `ghsaId` and human approval).\n' +
-      '  3. If an upgrade empirically fails during `npm install` or `npm run build`, revert only the broken package upgrade and explicitly warn the user with the exact compiler/peer error and every unresolved CRITICAL/HIGH CVE.\n'
+      '  3. If an upgrade empirically fails during `npm install` or `npm run build`, revert only the broken package upgrade and explicitly warn the user with the exact compiler/peer error and every unresolved CRITICAL/HIGH CVE.\n' +
+      '  4. If the audit is unavailable (no lockfile, offline, registry error), restore the prerequisite (`npm install` to create the lockfile, network access) and re-run; an unavailable audit is never treated as clean.\n'
   );
   process.exit(1);
 }
 
 console.log(
-  `✅ Dependency Guardrail Passed (${Object.keys(allDeps).length} direct packages checked${runRegistryAudit ? ' + registry CVE & freshness audit clean' : ''}).`
+  `✅ Dependency Guardrail Passed (${directNames.size} direct packages checked${auditRan && outdatedRan ? ' + registry CVE & freshness audit clean' : ''}).`
 );
-
-if (advisories.length > 0) {
-  console.log(`\n🛡️  [Low/Moderate Dependency Advisories] (${advisories.length}):`);
-  for (const adv of advisories) {
-    console.log(`  • ${adv}`);
-  }
-  console.log('');
-}
