@@ -1,0 +1,13 @@
+{
+  "name": "agentic-guardrails",
+  "private": true,
+  "type": "module",
+  "description": "Test harness for the agentic-guardrails skill (the skill itself is dependency-free).",
+  "engines": { "node": ">=22.6.0" },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

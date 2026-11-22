@@ -37,12 +37,13 @@ node <path-to-this-skill>/scripts/bootstrap-repo.mjs --target /path/to/target-re
 ```
 
 The bootstrapper automatically:
-- Creates the target directory (if needed) and installs `guardrails.config.ts`, `scripts/run-guardrails.ts`, `scripts/check-doc-drift.ts`, `scripts/check-complexity.ts`, and `.dependency-cruiser.cjs`.
+- Creates the target directory (if needed) and installs `guardrails.config.ts`, `scripts/run-guardrails.ts`, `scripts/git-changes.ts`, `scripts/check-doc-drift.ts`, `scripts/check-complexity.ts`, `scripts/check-deps.ts`, and `.dependency-cruiser.cjs`.
+- Validates `package.json` before writing anything, rejects unknown presets, and never overwrites existing files without `--force`.
 - Installs `AGENTS.md`, `CLAUDE.md` (`@AGENTS.md`), `.github/copilot-instructions.md`, `docs/adr/0001-layered-modular-boundaries.md`, and starter `src/<layer>/AGENTS.md` files for every configured module.
-- Updates `tsconfig.json` (if present) so `"scripts"` and `"guardrails.config.ts"` are excluded from Cloudflare Worker runtime typechecking (`@cloudflare/workers-types` vs Node CLI scripts).
+- Extends only the `exclude` list of `tsconfig.json` (if present and plain JSON) so `"scripts"` and `"guardrails.config.ts"` are excluded from Cloudflare Worker runtime typechecking (`@cloudflare/workers-types` vs Node CLI scripts).
 
 ### Step 2: Wire `package.json` Scripts & Playwright Config
-1. The bootstrapper adds these scripts to `package.json` if missing (verify them):
+1. The bootstrapper adds these scripts to `package.json` if missing (`check:types` only for Astro projects; verify them). In CI run `npm run guardrails -- --base origin/main` (clean working tree) and bootstrap per package inside npm workspaces. `check:deps --audit` fails closed when the audit cannot run. `visualSpecPath` is `null` by default; set it (and install `@playwright/test`) to enable Playwright gating:
    ```json
    {
      "scripts": {
