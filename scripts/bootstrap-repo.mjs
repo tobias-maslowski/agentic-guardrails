@@ -75,7 +75,7 @@ if (isStoryblok) {
     process.exit(1);
   }
   fs.writeFileSync(cfgPath, patched, 'utf8');
-  console.log('✅ Configured guardrails.config.ts for 6-layer Storyblok preset');
+  console.log('✅ Configured guardrails.config.ts for Storyblok preset');
 }
 
 // 2. Install Root Context Router (AGENTS.md), CLAUDE.md bridge, and GitHub Copilot instructions
